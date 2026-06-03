@@ -18,8 +18,15 @@ command.
 ## Install
 
 ```bash
+# install directly from GitHub (auto-synced with `git pull` on each `cs mac ...`)
+cs extensions install https://github.com/crafting-demo/ec2-mac.git
+```
+
+Other options:
+
+```bash
 # from a local checkout
-cs extensions install /absolute/path/to/cs-mac
+cs extensions install /absolute/path/to/ec2-mac
 
 # or put the executable on PATH as `cs-mac`
 # or commit it to <repo>/.sandbox/cli-extensions/cs-mac for per-repo auto-discovery
