@@ -527,26 +527,41 @@ no laptop IPs need to be allowlisted.
 
 This guide already produces everything `cs mac` needs except one small file. Two additions:
 
-1. **Publish `~/mac/connection.json` in the Mac-owning workspace.** Add
-   [`scripts/publish-connection.sh`](../scripts/publish-connection.sh) to your repo and wire it
-   as a `post-checkout` hook on the workspace that has `wait_for: [macos]` (the `dev` workspace
-   in this guide). It reads the Terraform resource state
-   (`/run/sandbox/fs/resources/macos/state`) and writes the metadata the extension consumes:
+1. **Publish `~/mac/connection.json` in the Mac-owning workspace.** The cleanest way needs no
+   new files or checkouts: inline it into the existing `build` hook (the `dev` workspace's
+   build hook already reads the resource state, so it already runs after the Mac is ready --
+   and it re-runs on resume, refreshing the IP). Prepend a few lines to the `build` hook
+   ([above](#sandbox-yaml-definition)):
 
    ```yaml
-   # in the dev workspace's checkout manifest overlay (alongside the existing build/ssh-tunnel)
-   manifest:
-     overlays:
-       - inline:
-           hooks:
-             post-checkout:
-               cmd: REPO_PATH=/Users/ec2-user/my-ios-app ./scripts/publish-connection.sh  # <-- REPLACE repo dir
+   hooks:
+     build:
+       cmd: |
+         set -e
+         # --- publish ~/mac/connection.json for the `cs mac` extension ---
+         IP=$(jq -r '.public_ip' /run/sandbox/fs/resources/macos/state)
+         if [ -n "${SANDBOX_FOLDER:-}" ]; then SB="$SANDBOX_ID"; else SB="$SANDBOX_NAME"; fi
+         mkdir -p ~/mac
+         cat > ~/mac/connection.json <<JSON
+         {
+           "workspaceHost": "${SANDBOX_WORKLOAD}--${SB}-${SANDBOX_ORG}${SANDBOX_SYSTEM_DNS_SUFFIX}",
+           "workspaceUser": "owner",
+           "macHost": "$IP",
+           "macUser": "ec2-user",
+           "repoPath": "/Users/ec2-user/my-ios-app"
+         }
+         JSON
+         # --- existing rsync + xcodebuild steps below ---
+         REMOTE="$IP"
+         rsync -az --exclude '.git' -e "ssh -o StrictHostKeyChecking=no" \
+           my-ios-app/ "ec2-user@$REMOTE:~/my-ios-app/"
+         ssh "ec2-user@$REMOTE" "cd ~/my-ios-app && xcodebuild -scheme MyApp -sdk iphoneos build"
    ```
 
-   Set `REPO_PATH` to where your code lives **on the Mac** (the same destination the `build`
-   hook rsyncs to). The script computes `workspaceHost` -- the ProxyJump target -- from the
-   workspace's own environment (`<workload>--<sandbox>-<org><sys-dns-suffix>`, using the sandbox
-   ID instead of the name only for sandboxes that live in a folder).
+   Set `repoPath` to where your code lives **on the Mac** (the destination the build hook
+   rsyncs to). `workspaceHost` -- the ProxyJump target -- is computed from the workspace's own
+   environment (`<workload>--<sandbox>-<org><sys-dns-suffix>`, using the sandbox ID instead of
+   the name only for sandboxes that live in a folder).
 
    The resulting file:
 
@@ -559,6 +574,11 @@ This guide already produces everything `cs mac` needs except one small file. Two
      "repoPath": "/Users/ec2-user/my-ios-app"
    }
    ```
+
+   > Prefer a checked-in script? [`scripts/publish-connection.sh`](../scripts/publish-connection.sh)
+   > does the same thing. Note that a hook `cmd: ./scripts/publish-connection.sh` runs relative
+   > to a checkout, so the script must live in a repo checked out into the workspace (or be
+   > dropped in via the workspace's `system.files`). The inline approach above avoids that.
 
 2. **Each developer installs the extension on their laptop** (`cs` already logged in; `code`
    or `cursor` CLI, the Remote-SSH extension, and `jq` present):

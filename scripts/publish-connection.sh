@@ -6,18 +6,14 @@
 # provisions the Mac via the macOS-in-Crafting-sandbox guide). It turns the Terraform
 # resource state into the ~/mac/connection.json file the `cs mac` extension reads.
 #
-# Wire it into your sandbox as a post-checkout hook on the Mac-owning workspace
-# (the one with `wait_for: [macos]`), e.g.:
+# This is an OPTIONAL checked-in alternative to inlining the same few lines into the
+# workspace's `build` hook (see docs/macos-in-crafting-sandbox.md, which is the recommended,
+# file-free approach). A hook `cmd: ./scripts/publish-connection.sh` runs relative to a
+# checkout, so to use this file it must live in a repo checked out into the workspace (or be
+# dropped in via the workspace's `system.files`).
 #
-#   manifest:
-#     overlays:
-#       - inline:
-#           hooks:
-#             post-checkout:
-#               cmd: ./scripts/publish-connection.sh
-#
-# Override the path that the repo is checked out to ON THE MAC with REPO_PATH
-# (defaults to /Users/ec2-user/<first checkout dir>, falling back to /Users/ec2-user).
+# Run it after the `macos` resource is ready (e.g. from the `build` hook). Override the path
+# the repo is checked out to ON THE MAC with REPO_PATH (defaults to /Users/ec2-user).
 set -euo pipefail
 
 STATE="${MAC_STATE_FILE:-/run/sandbox/fs/resources/macos/state}"

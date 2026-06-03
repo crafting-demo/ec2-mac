@@ -134,12 +134,12 @@ on the Mac.
 
 If you provisioned your Mac with the
 [macOS-in-Crafting-sandbox guide](docs/macos-in-crafting-sandbox.md), you only need to add one
-thing: publish `~/mac/connection.json` in the Mac-owning workspace. Drop
-[`scripts/publish-connection.sh`](scripts/publish-connection.sh) into your repo and wire it as
-a `post-checkout` hook on the workspace that has `wait_for: [macos]`. It builds the metadata
-file from the Terraform resource state automatically. See the
+thing: publish `~/mac/connection.json` in the Mac-owning workspace. The simplest way needs no
+new files -- inline a few lines into the existing `build` hook (which already reads the
+Terraform resource state and re-runs on resume). See the
 [guide's `cs mac` section](docs/macos-in-crafting-sandbox.md#connect-vs-code-directly-to-the-mac-with-cs-mac)
-for the exact steps.
+for the exact snippet. [`scripts/publish-connection.sh`](scripts/publish-connection.sh) is an
+optional checked-in alternative.
 
 ## Examples
 
