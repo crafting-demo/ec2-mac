@@ -1,0 +1,16 @@
+# local SSH artifacts / keys (never commit)
+*.pem
+*.key
+id_*
+known_hosts*
+.ssh/
+
+# editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# local scratch
+work-notes.md
+*.local

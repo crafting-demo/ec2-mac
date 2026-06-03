@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+#
+# cs-mac : a `cs` CLI extension that opens VS Code (or Cursor) Remote-SSH directly
+#          on an EC2 Mac, tunneling through the Crafting workspace that "owns" the
+#          Mac as an SSH jump host.
+#
+# Invoked as:  cs mac SANDBOX/WORKSPACE [PATH]      -> set up config + launch IDE
+#              cs mac ssh     SANDBOX/WORKSPACE      -> open an SSH shell on the Mac
+#              cs mac config  SANDBOX/WORKSPACE      -> (re)write SSH config only
+#              cs mac doctor  SANDBOX/WORKSPACE      -> run connectivity diagnostics
+#              cs mac reset   [SANDBOX/WORKSPACE]    -> remove managed SSH config
+#              cs mac help
+#
+# The `cs` CLI execs this file (named `cs-mac`) with the args AFTER `mac`, and
+# passes the full environment, so we can shell back into `cs exec` / `cs ssh`.
+#
+# SSH-config safety contract:
+#   * ~/.ssh/config is treated APPEND-ONLY: we only ever add a single
+#     `Include ~/.ssh/crafting-mac/config` line (and only if absent).
+#   * All of our Host entries live in the self-owned ~/.ssh/crafting-mac/config,
+#     fenced by per-alias markers so we never disturb other entries.
+#   * `cs mac reset` removes only our Include line + our own files.
+
+set -euo pipefail
+
+CS_BIN="${CS_BIN:-cs}"
+CRAFTING_DIR="${HOME}/.ssh/crafting-mac"
+MANAGED_CONFIG="${CRAFTING_DIR}/config"
+KEYS_DIR="${CRAFTING_DIR}/keys"
+KNOWN_HOSTS="${CRAFTING_DIR}/known_hosts"
+INCLUDE_LINE="Include ~/.ssh/crafting-mac/config"
+MAIN_CONFIG="${HOME}/.ssh/config"
+# Jump strategy: "proxyjump" (default) or "proxycommand" (cs exec nc fallback).
+CS_MAC_PROXY="${CS_MAC_PROXY:-proxyjump}"
+
+c_red()  { printf '\033[31m%s\033[0m\n' "$*" >&2; }
+c_grn()  { printf '\033[32m%s\033[0m\n' "$*"; }
+c_dim()  { printf '\033[2m%s\033[0m\n' "$*"; }
+die()    { c_red "cs mac: $*"; exit 1; }
+
+usage() {
+  sed -n '3,17p' "$0" | sed 's/^# \{0,1\}//'
+  exit "${1:-0}"
+}
+
+# --- argument parsing -------------------------------------------------------
+SUB="launch"
+case "${1:-}" in
+  ssh|config|doctor|reset|launch|vscode|code|cursor) SUB="$1"; shift ;;
+  help|-h|--help|"") [ "${1:-}" = "" ] && { usage 0; }; usage 0 ;;
+esac
+
+# reset can run without a target (cleans everything)
+if [ "$SUB" = "reset" ] && [ $# -eq 0 ]; then
+  do_reset_all() {
+    if [ -f "$MAIN_CONFIG" ]; then
+      grep -vxF "$INCLUDE_LINE" "$MAIN_CONFIG" > "${MAIN_CONFIG}.tmp" 2>/dev/null || true
+      mv "${MAIN_CONFIG}.tmp" "$MAIN_CONFIG"
+    fi
+    rm -f "$MANAGED_CONFIG"
+    c_grn "cs mac: removed Include line and ${MANAGED_CONFIG} (keys under ${KEYS_DIR} kept)."
+  }
+  do_reset_all
+  exit 0
+fi
+
+TARGET="${1:-}"
+[ -n "$TARGET" ] || die "missing SANDBOX/WORKSPACE target. Try: cs mac <sandbox>/<workspace>"
+shift || true
+SUBPATH_ARG="${1:-}"   # optional folder to open on the Mac
+
+case "$TARGET" in
+  */*) : ;;
+  *)   die "target must be SANDBOX/WORKSPACE (got '$TARGET')" ;;
+esac
+SANDBOX="${TARGET%%/*}"
+ALIAS="crafting-mac-${SANDBOX}"
+
+# --- read the Mac connection metadata that the jumpbox "owns" ---------------
+fetch_info() {
+  local raw
+  raw="$($CS_BIN exec -W "$TARGET" -- bash -lc 'cat ~/mac/connection.json' 2>/dev/null || true)"
+  [ -n "$raw" ] || die "could not read ~/mac/connection.json on $TARGET. Is the jumpbox running and provisioned?"
+  echo "$raw" | jq -e . >/dev/null 2>&1 || die "connection.json on $TARGET is not valid JSON"
+  MAC_HOST="$(echo "$raw" | jq -r '.macHost // empty')"
+  MAC_USER="$(echo "$raw" | jq -r '.macUser // "ec2-user"')"
+  WS_HOST="$(echo "$raw"  | jq -r '.workspaceHost // empty')"
+  REPO_PATH="$(echo "$raw" | jq -r '.repoPath // empty')"
+  [ -n "$MAC_HOST" ] || die "connection.json missing .macHost"
+  [ -n "$WS_HOST" ]  || die "connection.json missing .workspaceHost (needed for ProxyJump)"
+  [ -n "$REPO_PATH" ] || REPO_PATH="/Users/${MAC_USER}"
+}
+
+# --- ensure a local keypair for this sandbox -------------------------------
+ensure_key() {
+  mkdir -p "$KEYS_DIR"; chmod 700 "$CRAFTING_DIR"
+  KEYFILE="${KEYS_DIR}/${SANDBOX}"
+  if [ ! -f "$KEYFILE" ]; then
+    ssh-keygen -t ed25519 -f "$KEYFILE" -N "" -C "cs-mac-${SANDBOX}" >/dev/null
+    c_dim "Generated local key ${KEYFILE}"
+  fi
+  LAPTOP_PUB="$(cat "${KEYFILE}.pub")"
+}
+
+# --- install the laptop pubkey on the Mac, via the jumpbox -----------------
+bootstrap_key() {
+  local remote_cmd
+  remote_cmd='read -r PUB; KEY_OPT=""; [ -f "$HOME/.ssh/id_mac" ] && KEY_OPT="-i $HOME/.ssh/id_mac";'
+  remote_cmd+=' printf "%s\n" "$PUB" | ssh $KEY_OPT -o BatchMode=yes -o StrictHostKeyChecking=accept-new'
+  remote_cmd+=' -o UserKnownHostsFile="$HOME/.ssh/known_hosts_mac" -o ConnectTimeout=15 '"${MAC_USER}@${MAC_HOST}"
+  remote_cmd+=' "umask 077; mkdir -p ~/.ssh; cat >> ~/.ssh/authorized_keys; sort -u ~/.ssh/authorized_keys -o ~/.ssh/authorized_keys; echo BOOTSTRAP_OK"'
+  if printf '%s\n' "$LAPTOP_PUB" | $CS_BIN exec -W "$TARGET" -- bash -lc "$remote_cmd" 2>/dev/null | grep -q BOOTSTRAP_OK; then
+    c_dim "Installed laptop key on ${MAC_USER}@${MAC_HOST} (via ${TARGET})"
+  else
+    c_red "Warning: could not auto-install laptop key on the Mac via the jumpbox."
+    c_red "  The jumpbox must be able to SSH to the Mac (its key in the Mac's authorized_keys)."
+    c_red "  Continuing anyway in case the key is already present."
+  fi
+}
+
+# --- write our managed SSH config block (per-alias, fenced) ----------------
+write_config() {
+  mkdir -p "$CRAFTING_DIR"; chmod 700 "$CRAFTING_DIR"
+  touch "$MANAGED_CONFIG"; chmod 600 "$MANAGED_CONFIG"
+
+  local proxy_line
+  if [ "$CS_MAC_PROXY" = "proxycommand" ]; then
+    proxy_line="  ProxyCommand ${CS_BIN} exec -W ${TARGET} -T -- nc ${MAC_HOST} 22"
+  else
+    proxy_line="  ProxyJump ${WS_HOST}"
+  fi
+
+  local begin="# >>> cs-mac ${ALIAS}"
+  local end="# <<< cs-mac ${ALIAS}"
+  # Drop any existing block for this alias, then append a fresh one.
+  awk -v b="$begin" -v e="$end" '
+    $0==b {skip=1} skip && $0==e {skip=0; next} skip {next} {print}
+  ' "$MANAGED_CONFIG" > "${MANAGED_CONFIG}.tmp" || true
+  mv "${MANAGED_CONFIG}.tmp" "$MANAGED_CONFIG"
+
+  {
+    echo "$begin"
+    echo "Host ${ALIAS}"
+    echo "  HostName ${MAC_HOST}"
+    echo "  User ${MAC_USER}"
+    echo "  IdentityFile ${KEYFILE}"
+    echo "  IdentitiesOnly yes"
+    echo "$proxy_line"
+    echo "  StrictHostKeyChecking accept-new"
+    echo "  UserKnownHostsFile ${KNOWN_HOSTS}"
+    echo "  ServerAliveInterval 30"
+    echo "  ServerAliveCountMax 3"
+    echo "$end"
+  } >> "$MANAGED_CONFIG"
+
+  # Ensure the single Include line exists at the TOP of ~/.ssh/config (append-only).
+  touch "$MAIN_CONFIG"; chmod 600 "$MAIN_CONFIG"
+  if ! grep -qxF "$INCLUDE_LINE" "$MAIN_CONFIG"; then
+    printf '%s\n\n' "$INCLUDE_LINE" | cat - "$MAIN_CONFIG" > "${MAIN_CONFIG}.tmp"
+    mv "${MAIN_CONFIG}.tmp" "$MAIN_CONFIG"
+    c_dim "Added '${INCLUDE_LINE}' to ${MAIN_CONFIG}"
+  fi
+}
+
+smoke_test() {
+  c_dim "Testing: ssh ${ALIAS} ..."
+  if ssh -o BatchMode=yes -o ConnectTimeout=30 "$ALIAS" 'true' 2>/dev/null; then
+    c_grn "SSH OK: ${ALIAS} -> ${MAC_USER}@${MAC_HOST} (via ${WS_HOST})"
+    return 0
+  fi
+  c_red "SSH smoke test failed for ${ALIAS}."
+  return 1
+}
+
+find_ide() {
+  # Honor CS_MAC_IDE, else prefer the subcommand, else code, else cursor.
+  local want="${CS_MAC_IDE:-}"
+  if [ "$SUB" = "cursor" ]; then want="cursor"; fi
+  if [ "$SUB" = "vscode" ] || [ "$SUB" = "code" ]; then want="${want:-code}"; fi
+  local cand
+  for cand in ${want:-} code cursor; do
+    if command -v "$cand" >/dev/null 2>&1; then echo "$cand"; return 0; fi
+  done
+  return 1
+}
+
+launch_ide() {
+  local sub="${SUBPATH_ARG:-}"
+  local open_path
+  case "$sub" in
+    ""|".") open_path="$REPO_PATH" ;;
+    /*)     open_path="$sub" ;;
+    *)      open_path="${REPO_PATH%/}/$sub" ;;
+  esac
+  local ide; ide="$(find_ide)" || die "no 'code' or 'cursor' CLI found on PATH. Open manually: vscode-remote://ssh-remote+${ALIAS}${open_path}"
+  local uri="vscode-remote://ssh-remote+${ALIAS}${open_path}"
+  c_grn "Launching ${ide} -> ${uri}"
+  exec "$ide" --folder-uri "$uri"
+}
+
+# --- subcommands ------------------------------------------------------------
+case "$SUB" in
+  reset)
+    begin="# >>> cs-mac ${ALIAS}"; end="# <<< cs-mac ${ALIAS}"
+    if [ -f "$MANAGED_CONFIG" ]; then
+      awk -v b="$begin" -v e="$end" '$0==b{skip=1} skip && $0==e{skip=0;next} skip{next} {print}' "$MANAGED_CONFIG" > "${MANAGED_CONFIG}.tmp" && mv "${MANAGED_CONFIG}.tmp" "$MANAGED_CONFIG"
+      c_grn "cs mac: removed config block for ${ALIAS}."
+    fi
+    ;;
+  config)
+    fetch_info; ensure_key; write_config
+    c_grn "Wrote SSH config for ${ALIAS}:"; sed -n "/# >>> cs-mac ${ALIAS}/,/# <<< cs-mac ${ALIAS}/p" "$MANAGED_CONFIG"
+    ;;
+  doctor)
+    fetch_info; ensure_key
+    echo "Target          : $TARGET"
+    echo "Mac             : ${MAC_USER}@${MAC_HOST}"
+    echo "Jump (workspace): ${WS_HOST}"
+    echo "Alias           : ${ALIAS}"
+    printf 'Include present : '; grep -qxF "$INCLUDE_LINE" "$MAIN_CONFIG" 2>/dev/null && echo yes || echo "NO (run: cs mac config $TARGET)"
+    printf 'Host block      : '; sed -n "/# >>> cs-mac ${ALIAS}/,/# <<< cs-mac ${ALIAS}/p" "$MANAGED_CONFIG" 2>/dev/null | grep -q "Host ${ALIAS}" && echo yes || echo "NO (run: cs mac config $TARGET)"
+    printf 'Jump reachable  : '; ssh -o BatchMode=yes -o ConnectTimeout=20 "$WS_HOST" true 2>/dev/null && echo yes || echo "NO (check cs login / workspace)"
+    printf 'Mac reachable   : '; ssh -o BatchMode=yes -o ConnectTimeout=30 "$ALIAS" true 2>/dev/null && echo yes || echo "NO (run: cs mac config $TARGET, then retry)"
+    printf 'code/cursor CLI : '; find_ide >/dev/null 2>&1 && echo "$(find_ide)" || echo "not found on PATH"
+    ;;
+  ssh)
+    fetch_info; ensure_key; bootstrap_key; write_config
+    smoke_test || true
+    exec ssh "$ALIAS"
+    ;;
+  launch|vscode|code|cursor)
+    fetch_info; ensure_key; bootstrap_key; write_config
+    smoke_test || die "cannot reach the Mac yet; run 'cs mac doctor $TARGET' for details."
+    launch_ide
+    ;;
+  *)
+    usage 1 ;;
+esac

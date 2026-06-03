@@ -1,0 +1,11 @@
+{
+  "workspaceHost": "gw--<sandbox-id>-<org>.<sys-dns-suffix>",
+  "workspaceUser": "owner",
+  "csTarget": "<sandbox>/<workspace>",
+  "macHost": "<public-or-private-ip>",
+  "macUser": "ec2-user",
+  "repoPath": "/Users/ec2-user/<repo>",
+  "instanceId": "i-xxxxxxxxxxxxxxxxx",
+  "hostId": "h-xxxxxxxxxxxxxxxxx",
+  "region": "us-west-2"
+}
