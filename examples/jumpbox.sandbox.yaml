@@ -1,9 +1,10 @@
 # Minimal "jumpbox" sandbox: a small Linux workspace that owns the Mac.
 #
-# Its only jobs are (1) to be able to reach the Mac on TCP :22, and (2) to expose
-# ~/mac/connection.json (see examples/connection.json). In a real setup you would
-# also provision the Mac here (e.g. a Terraform resource) and write connection.json
-# from its outputs.
+# Its only jobs are (1) to be able to reach the Mac on TCP :22, and (2) to expose the
+# Mac IP on the workspace. In a real setup you provision the Mac here (e.g. a Terraform
+# resource) whose state lands at /run/sandbox/fs/resources/macos/state -- the file the
+# `cs mac` extension reads .public_ip from by default (override with CS_MAC_STATE /
+# CS_MAC_HOST).
 #
 # Replace <base-workspace-image> with a Linux workspace base image available to your org
 # (it must include `ssh`, `nc`, and `ssh-keygen`).

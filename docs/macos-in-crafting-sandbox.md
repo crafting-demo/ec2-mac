@@ -85,7 +85,9 @@ Allocate at least **200 GB** of EBS storage. Xcode alone requires ~35 GB, plus s
 
 ## Repository Structure
 
-Your sandbox repository should follow this layout:
+Your sandbox repository should follow this layout. **All of these files are included in this
+repo** — the sections below explain each one and link to it; fork the repo and fill in the
+`# <-- REPLACE` markers.
 
 ```
 .sandbox/
@@ -103,7 +105,7 @@ scripts/
 
 The Terraform files provision the Mac infrastructure. The scripts run inside the Crafting workspace and interact with the Mac over SSH. The sandbox YAML ties them together with lifecycle handlers.
 
-> **Important:** Make all shell scripts executable before committing: `chmod +x terraform/env.sh scripts/*.sh`
+> **Important:** The shell scripts are already committed executable. If you add your own, make them executable: `chmod +x terraform/env.sh scripts/*.sh`
 
 ---
 
@@ -111,176 +113,44 @@ The Terraform files provision the Mac infrastructure. The scripts run inside the
 
 The Terraform module manages the full lifecycle of the Mac instance: allocate a Dedicated Host, launch an instance, inject SSH keys, and clean up on destroy. The suspend/resume strategy terminates the instance but keeps the Dedicated Host to avoid re-triggering the 24-hour billing minimum.
 
-### env.sh
+### env.sh — [`terraform/env.sh`](../terraform/env.sh)
 
-This script exports sandbox environment variables as JSON for Terraform's `data "external"` data source. It provides the sandbox name (for tagging) and the workspace's SSH public key (for injection into the Mac's authorized_keys).
+Exports sandbox environment variables as JSON for Terraform's `data "external"` data source. It provides the sandbox name (for tagging) and the workspace's SSH public key (for injection into the Mac's authorized_keys):
 
 ```bash
-#!/bin/bash
 public_key=$(ssh-add -L | head -1)
 cat <<EOF
-{
-  "sandbox_name": "$SANDBOX_NAME",
-  "sandbox_id": "$SANDBOX_ID",
-  "ssh_pub": "$public_key"
-}
+{ "sandbox_name": "$SANDBOX_NAME", "sandbox_id": "$SANDBOX_ID", "ssh_pub": "$public_key" }
 EOF
 ```
 
-### variables.tf
+### variables.tf — [`terraform/variables.tf`](../terraform/variables.tf)
 
-```hcl
-variable "instance_type" {
-  description = "EC2 Mac instance type"
-  default     = "mac2.metal"
-}
+Declares the configurable inputs: `instance_type` (default `mac2.metal`), `ami_id`, `availability_zone`, `vpc_id`, `subnet_id`, and `suspended` (the suspend/resume toggle). See the [Required Terraform Variables](#required-terraform-variables) table above.
 
-variable "ami_id" {
-  description = "macOS AMI ID (use a custom AMI with Xcode pre-installed for faster startup)"
-  type        = string
-}
+### main.tf — [`terraform/main.tf`](../terraform/main.tf)
 
-variable "availability_zone" {
-  description = "AZ that supports Mac instances"
-  type        = string
-}
+Provisions the full lifecycle. The key pieces:
 
-variable "vpc_id" {
-  description = "VPC to launch the instance in"
-  type        = string
-}
+- A **Dedicated Host** (`aws_ec2_host.mac`) that persists across suspend/resume.
+- A **security group** (open to `0.0.0.0/0` in the example — lock this down to your Crafting egress CIDR for production; see [Security](#security)).
+- The **Mac instance** (`aws_instance.mac`), gated by `count = var.suspended ? 0 : 1` so suspend terminates it while the host persists. Its `user_data` injects the workspace key:
 
-variable "subnet_id" {
-  description = "Subnet in the target AZ"
-  type        = string
-}
-
-variable "suspended" {
-  description = "When true, the instance is terminated but the Dedicated Host persists"
-  type        = bool
-  default     = false
-}
-```
-
-### main.tf
-
-```hcl
-terraform {
-  required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = ">=5"
-    }
-  }
-}
-
-data "external" "env" {
-  program = ["${path.module}/env.sh"]
-}
-
-provider "aws" {
-  default_tags {
-    tags = {
-      Sandbox   = data.external.env.result.sandbox_name
-      SandboxID = data.external.env.result.sandbox_id
-      ManagedBy = "crafting-sandbox"
-    }
-  }
-}
-
-# --- Dedicated Host (persists across suspend/resume) ---
-
-resource "aws_ec2_host" "mac" {
-  instance_type     = var.instance_type
-  availability_zone = var.availability_zone
-  auto_placement    = "on"
-
-  tags = {
-    Name = "crafting-mac-${data.external.env.result.sandbox_name}"
-  }
-}
-
-# --- Security Group ---
-
-resource "aws_security_group" "mac" {
-  name_prefix = "crafting-mac-"
-  vpc_id      = var.vpc_id
-
-  ingress {
-    description = "SSH"
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = {
-    Name = "crafting-mac-${data.external.env.result.sandbox_name}"
-  }
-}
-
-# --- Mac Instance (terminated on suspend, re-created on resume) ---
-
-resource "aws_instance" "mac" {
-  count = var.suspended ? 0 : 1
-
-  ami                    = var.ami_id
-  instance_type          = var.instance_type
-  host_id                = aws_ec2_host.mac.id
-  subnet_id              = var.subnet_id
-  vpc_security_group_ids = [aws_security_group.mac.id]
-
-  root_block_device {
-    volume_size = 200
-    volume_type = "gp3"
-  }
-
+  ```hcl
   user_data = <<-EOT
     #!/bin/bash
-    # Inject the sandbox SSH public key for passwordless access
     mkdir -p /Users/ec2-user/.ssh
     echo "${data.external.env.result.ssh_pub}" >> /Users/ec2-user/.ssh/authorized_keys
-    chmod 700 /Users/ec2-user/.ssh
-    chmod 600 /Users/ec2-user/.ssh/authorized_keys
+    chmod 700 /Users/ec2-user/.ssh && chmod 600 /Users/ec2-user/.ssh/authorized_keys
     chown -R ec2-user:staff /Users/ec2-user/.ssh
   EOT
+  ```
 
-  tags = {
-    Name = "crafting-mac-${data.external.env.result.sandbox_name}"
-  }
-}
+- A `null_resource.wait_for_ssh` that blocks until the Mac accepts SSH.
 
-# --- Wait for SSH to become available ---
+### outputs.tf — [`terraform/outputs.tf`](../terraform/outputs.tf)
 
-resource "null_resource" "wait_for_ssh" {
-  count = var.suspended ? 0 : 1
-
-  depends_on = [aws_instance.mac]
-
-  provisioner "remote-exec" {
-    connection {
-      type    = "ssh"
-      user    = "ec2-user"
-      host    = aws_instance.mac[0].public_ip
-      agent   = true
-      timeout = "10m"
-    }
-
-    inline = ["echo 'SSH is ready'"]
-  }
-}
-```
-
-### outputs.tf
-
-The `output` block aggregates all values into a single object. The Crafting resource system reads this named output (configured via `output: output` in the sandbox YAML) and saves it as the resource state, available at `/run/sandbox/fs/resources/macos/state` in the workspace. The brief and details templates reference these fields as `{{output.public_ip}}`, `{{output.instance_id}}`, etc.
+The `output` block aggregates all values into a single object. The Crafting resource system reads this named output (configured via `output: output` in the sandbox YAML) and saves it as the resource state at `/run/sandbox/fs/resources/macos/state` in the workspace — the same file the `cs mac` extension reads. The brief/details templates reference these fields as `{{output.public_ip}}`, etc.
 
 ```hcl
 output "output" {
@@ -309,87 +179,32 @@ This means:
 
 ## Sandbox YAML Definition
 
-The sandbox definition ties the Terraform resource, workspace, and lifecycle together. Save this as `.sandbox/template.yaml` in your repository.
+The sandbox definition ties the Terraform resource, workspace, and lifecycle together. The full file is [`.sandbox/template.yaml`](../.sandbox/template.yaml).
 
-> **Before deploying:** Search for `# <-- REPLACE` comments in the YAML below and substitute your actual values (repo URLs, scheme name, directory names).
+> **Before deploying:** Search for `# <-- REPLACE` comments in [`.sandbox/template.yaml`](../.sandbox/template.yaml) and substitute your actual values (repo URLs, scheme name, directory names).
+
+It has two workspaces and one resource: the `dev` workspace edits code and builds on the Mac (with `wait_for: [macos]` so it doesn't start until the Mac is ready), and the `provisioner` workspace checks out this repo's `terraform/` (into `infra`) and runs it. The `macos` resource wires Terraform into the sandbox lifecycle:
 
 ```yaml
-overview: |
-  # iOS Development with macOS
-
-  This sandbox provisions an EC2 Mac instance for iOS builds.
-  Source code is edited in the Crafting workspace and built on the Mac via SSH.
-
-  - **Mac Instance**: click the `macos` resource for connection details
-  - **Build**: run `./scripts/build-ios.sh` in the workspace terminal
-
-workspaces:
-  - name: dev
-    checkouts:
-      - path: my-ios-app                               # <-- REPLACE with your app directory name
-        repo:
-          git: https://github.com/myorg/my-ios-app      # <-- REPLACE with your iOS app repo URL
-        manifest:
-          overlays:
-            - inline:
-                hooks:
-                  build:
-                    cmd: |
-                      set -e
-                      REMOTE=$(jq -r ".public_ip" /run/sandbox/fs/resources/macos/state)
-                      rsync -az --exclude '.git' -e "ssh -o StrictHostKeyChecking=no" \
-                        my-ios-app/ "ec2-user@$REMOTE:~/my-ios-app/"
-                      ssh "ec2-user@$REMOTE" "cd ~/my-ios-app && xcodebuild -scheme MyApp -sdk iphoneos build"  # <-- REPLACE scheme and dir
-                daemons:
-                  ssh-tunnel:
-                    run:
-                      cmd: |
-                        REMOTE=$(jq -r ".public_ip" /run/sandbox/fs/resources/macos/state)
-                        ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 \
-                          -N "ec2-user@$REMOTE"
-    wait_for:
-      - macos
-    env:
-      - AWS_CONFIG_FILE=/run/sandbox/fs/secrets/shared/aws-config
-
-  - name: provisioner
-    base_snapshot: oci://us-docker.pkg.dev/crafting-dev/sandbox/shared/workspace:latest
-    checkouts:
-      - path: infra
-        repo:
-          git: https://github.com/myorg/my-ios-sandbox  # <-- REPLACE with your infra/terraform repo URL
-    env:
-      - AWS_CONFIG_FILE=/run/sandbox/fs/secrets/shared/aws-config
-
 resources:
   - name: macos
     brief: "macOS: {{output.public_ip}}"
-    details: |
-      **EC2 Mac Instance**
-
-      - Public IP: {{output.public_ip}}
-      - Instance ID: {{output.instance_id}}
-      - Host ID: {{output.host_id}}
-
-      Connect from the workspace terminal:
-      ```
-      ssh ec2-user@{{output.public_ip}}
-      ```
-
-      Resource state: `/run/sandbox/fs/resources/macos/state`
     terraform:
       workspace: provisioner
-      dir: infra/terraform
+      dir: infra/terraform        # provisioner checks this repo out into `infra`
       output: output
-      save_state: true
+      save_state: true            # -> /run/sandbox/fs/resources/macos/state
       run:
         timeout: 30m0s
+      # Specifying on_suspend automatically enables resume (terraform apply with
+      # suspended=false); there is no separate on_resume field.
       on_suspend:
         vars:
           suspended: "true"
-      on_resume: {}
       on_delete: {}
 ```
+
+The `dev` workspace's `build` hook reads the Mac IP from the resource state and rsyncs + `xcodebuild`s over SSH; an `ssh-tunnel` daemon keeps a persistent connection. See the full file for both.
 
 ### How It Works
 
@@ -399,7 +214,7 @@ resources:
 
 3. **Suspend**: The platform runs `terraform apply -auto-approve -var suspended=true`, which terminates the Mac instance but keeps the Dedicated Host.
 
-4. **Resume**: Because `on_resume: {}` is specified, the platform runs `terraform apply -auto-approve` (suspended defaults to false), launching a new instance on the same host. The `dev` workspace waits for the resource, then re-runs its build hook and restarts daemons.
+4. **Resume**: Specifying `on_suspend` automatically enables resume, so the platform runs `terraform apply -auto-approve` (suspended defaults to false), launching a new instance on the same host. The `dev` workspace waits for the resource, then re-runs its build hook and restarts daemons.
 
 5. **Delete**: The platform runs `terraform destroy -auto-approve`, terminating the instance and releasing the Dedicated Host. Note: if the Dedicated Host has been allocated for less than 24 hours, the destroy will fail (see [Troubleshooting](#troubleshooting)).
 
@@ -407,98 +222,21 @@ resources:
 
 ## Workspace Scripts
 
-These scripts run inside the `dev` workspace and interact with the Mac over SSH. All of them read the Mac's IP from the resource state file.
+These scripts run inside the `dev` workspace and interact with the Mac over SSH. All of them
+read the Mac's IP from the resource state file (`/run/sandbox/fs/resources/macos/state`). They
+are committed in [`scripts/`](../scripts) (already executable).
 
-> **Important:** Make all scripts executable before committing: `chmod +x scripts/*.sh`
+- **[`scripts/setup-ssh.sh`](../scripts/setup-ssh.sh)** — writes a `Host mac` entry into
+  `~/.ssh/config` pointing at the Mac's IP, so you can just `ssh mac` from the workspace.
+- **[`scripts/sync-code.sh`](../scripts/sync-code.sh)** `[PROJECT_DIR]` — rsyncs a local
+  directory to `~/<dir>` on the Mac (excludes `.git`, `DerivedData`, `build`).
+- **[`scripts/build-ios.sh`](../scripts/build-ios.sh)** `[SCHEME] [PROJECT_DIR]` — syncs, then
+  runs `xcodebuild -scheme <SCHEME> -sdk iphoneos -configuration Release build` over SSH. To
+  pull back artifacts, rsync `~/<dir>/build/Release-iphoneos/` from the Mac.
 
-### scripts/setup-ssh.sh
-
-Configure SSH for convenient access to the Mac. Run this manually or from a workspace lifecycle handler.
-
-```bash
-#!/bin/bash
-set -e
-
-REMOTE=$(jq -r ".public_ip" /run/sandbox/fs/resources/macos/state)
-
-if [ -z "$REMOTE" ] || [ "$REMOTE" = "null" ]; then
-  echo "Mac instance not ready yet (no IP in resource state)"
-  exit 1
-fi
-
-mkdir -p ~/.ssh
-
-cat > ~/.ssh/config <<EOF
-Host mac
-  HostName $REMOTE
-  User ec2-user
-  StrictHostKeyChecking no
-  UserKnownHostsFile /dev/null
-  ServerAliveInterval 30
-  ServerAliveCountMax 3
-EOF
-
-echo "SSH configured. Test with: ssh mac"
-ssh -o ConnectTimeout=10 mac "echo 'Connection to Mac successful'"
-```
-
-After running this script, you can simply use `ssh mac` from the workspace terminal.
-
-### scripts/sync-code.sh
-
-Push source code from the workspace to the Mac using rsync.
-
-```bash
-#!/bin/bash
-set -e
-
-REMOTE=$(jq -r ".public_ip" /run/sandbox/fs/resources/macos/state)
-PROJECT_DIR="${1:-.}"
-
-rsync -az --delete \
-  --exclude '.git' \
-  --exclude 'DerivedData' \
-  --exclude 'build' \
-  -e "ssh -o StrictHostKeyChecking=no" \
-  "$PROJECT_DIR/" "ec2-user@$REMOTE:~/$(basename "$PROJECT_DIR")/"
-
-echo "Code synced to Mac at ~/$(basename "$PROJECT_DIR")"
-```
-
-### scripts/build-ios.sh
-
-Build an iOS project on the Mac and pull back the build artifacts.
-
-```bash
-#!/bin/bash
-set -e
-
-REMOTE=$(jq -r ".public_ip" /run/sandbox/fs/resources/macos/state)
-SCHEME="${1:-MyApp}"
-PROJECT_DIR="${2:-my-ios-app}"
-
-echo "==> Syncing code to Mac..."
-rsync -az --delete \
-  --exclude '.git' \
-  --exclude 'DerivedData' \
-  --exclude 'build' \
-  -e "ssh -o StrictHostKeyChecking=no" \
-  "$PROJECT_DIR/" "ec2-user@$REMOTE:~/$PROJECT_DIR/"
-
-echo "==> Building $SCHEME on Mac..."
-ssh -o StrictHostKeyChecking=no "ec2-user@$REMOTE" \
-  "cd ~/$PROJECT_DIR && xcodebuild -scheme $SCHEME -sdk iphoneos -configuration Release build"
-
-echo "==> Build complete."
-```
-
-To pull back artifacts (e.g., the .app or .ipa):
-
-```bash
-rsync -az -e "ssh -o StrictHostKeyChecking=no" \
-  "ec2-user@$REMOTE:~/$PROJECT_DIR/build/Release-iphoneos/" \
-  "./build-output/"
-```
+> The `dev` workspace's `build` hook in [`.sandbox/template.yaml`](../.sandbox/template.yaml)
+> performs the sync + build automatically; these scripts are for running the same steps by
+> hand from the workspace terminal.
 
 ---
 
@@ -525,71 +263,32 @@ no laptop IPs need to be allowlisted.
 
 ### What you must add (if you followed this guide as-is)
 
-This guide already produces everything `cs mac` needs except one small file. Two additions:
+**Nothing in the workspace.** This guide already saves the Terraform output (including
+`public_ip`) to the resource state at `/run/sandbox/fs/resources/macos/state`, and that is
+exactly where `cs mac` reads the Mac IP from. The extension computes everything else
+(the workspace jump-host FQDN from the workspace's `SANDBOX_*` environment; the Mac user
+defaults to `ec2-user`). There is no `connection.json` to publish and no extra hook.
 
-1. **Publish `~/mac/connection.json` in the Mac-owning workspace.** The cleanest way needs no
-   new files or checkouts: inline it into the existing `build` hook (the `dev` workspace's
-   build hook already reads the resource state, so it already runs after the Mac is ready --
-   and it re-runs on resume, refreshing the IP). Prepend a few lines to the `build` hook
-   ([above](#sandbox-yaml-definition)):
+So the only step is on the developer's laptop. Each developer installs the extension
+(`cs` already logged in; `code` or `cursor` CLI, the Remote-SSH extension, and `jq` present):
 
-   ```yaml
-   hooks:
-     build:
-       cmd: |
-         set -e
-         # --- publish ~/mac/connection.json for the `cs mac` extension ---
-         IP=$(jq -r '.public_ip' /run/sandbox/fs/resources/macos/state)
-         if [ -n "${SANDBOX_FOLDER:-}" ]; then SB="$SANDBOX_ID"; else SB="$SANDBOX_NAME"; fi
-         mkdir -p ~/mac
-         cat > ~/mac/connection.json <<JSON
-         {
-           "workspaceHost": "${SANDBOX_WORKLOAD}--${SB}-${SANDBOX_ORG}${SANDBOX_SYSTEM_DNS_SUFFIX}",
-           "workspaceUser": "owner",
-           "macHost": "$IP",
-           "macUser": "ec2-user",
-           "repoPath": "/Users/ec2-user/my-ios-app"
-         }
-         JSON
-         # --- existing rsync + xcodebuild steps below ---
-         REMOTE="$IP"
-         rsync -az --exclude '.git' -e "ssh -o StrictHostKeyChecking=no" \
-           my-ios-app/ "ec2-user@$REMOTE:~/my-ios-app/"
-         ssh "ec2-user@$REMOTE" "cd ~/my-ios-app && xcodebuild -scheme MyApp -sdk iphoneos build"
-   ```
+```bash
+cs extensions install https://github.com/crafting-demo/ec2-mac.git
 
-   Set `repoPath` to where your code lives **on the Mac** (the destination the build hook
-   rsyncs to). `workspaceHost` -- the ProxyJump target -- is computed from the workspace's own
-   environment (`<workload>--<sandbox>-<org><sys-dns-suffix>`, using the sandbox ID instead of
-   the name only for sandboxes that live in a folder).
+# open the repo that the build hook rsyncs to on the Mac:
+cs mac <sandbox>/dev /Users/ec2-user/my-ios-app
+```
 
-   The resulting file:
-
-   ```json
-   {
-     "workspaceHost": "dev--<sandbox>-<org>.<sys-dns-suffix>",
-     "workspaceUser": "owner",
-     "macHost": "<public_ip from resource state>",
-     "macUser": "ec2-user",
-     "repoPath": "/Users/ec2-user/my-ios-app"
-   }
-   ```
-
-   > Prefer a checked-in script? [`scripts/publish-connection.sh`](../scripts/publish-connection.sh)
-   > does the same thing. Note that a hook `cmd: ./scripts/publish-connection.sh` runs relative
-   > to a checkout, so the script must live in a repo checked out into the workspace (or be
-   > dropped in via the workspace's `system.files`). The inline approach above avoids that.
-
-2. **Each developer installs the extension on their laptop** (`cs` already logged in; `code`
-   or `cursor` CLI, the Remote-SSH extension, and `jq` present):
-
-   ```bash
-   cs extensions install https://github.com/crafting-demo/ec2-mac.git
-   cs mac <sandbox>/dev          # opens VS Code on the Mac, via the workspace jump host
-   ```
+Pass the folder to open on the Mac as the last argument (or set a default with
+`CS_MAC_REPO=/Users/ec2-user/my-ios-app`). With no path argument it opens `/Users/ec2-user`.
 
 That's it. No security-group change is required -- the existing Crafting-egress allowlist
 already permits the workspace -> Mac:22 hop, which is the only path `cs mac` uses.
+
+> **Need to override a default?** All overrides are laptop-side env vars — no workspace change:
+> `CS_MAC_STATE` (resource not named `macos`), `CS_MAC_HOST` (a VPC-peered private IP not in
+> the state), `CS_MAC_USER` (Mac login other than `ec2-user`), `CS_MAC_REPO` (default folder
+> to open). See the [`cs mac` README](https://github.com/crafting-demo/ec2-mac#overrides-for-non-default-setups).
 
 ### How key access works
 

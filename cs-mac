@@ -32,6 +32,17 @@ INCLUDE_LINE="Include ~/.ssh/crafting-mac/config"
 MAIN_CONFIG="${HOME}/.ssh/config"
 # Jump strategy: "proxyjump" (default) or "proxycommand" (cs exec nc fallback).
 CS_MAC_PROXY="${CS_MAC_PROXY:-proxyjump}"
+# Mac connection inputs, all overridable from the laptop env:
+#   CS_MAC_STATE  path to the Terraform resource state on the workspace; we read
+#                 .public_ip from it (the macOS-in-Crafting guide saves it here,
+#                 so no "publish" step is needed).
+#   CS_MAC_HOST   override the Mac IP/host directly (skips the state file; use
+#                 for a VPC-peered private IP that isn't in the state).
+#   CS_MAC_USER   login user on the Mac (default ec2-user).
+#   CS_MAC_REPO   default folder to open on the Mac when no PATH arg is given.
+CS_MAC_STATE="${CS_MAC_STATE:-/run/sandbox/fs/resources/macos/state}"
+CS_MAC_HOST="${CS_MAC_HOST:-}"
+CS_MAC_USER_DEFAULT="${CS_MAC_USER:-ec2-user}"
 
 c_red()  { printf '\033[31m%s\033[0m\n' "$*" >&2; }
 c_grn()  { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -76,19 +87,22 @@ esac
 SANDBOX="${TARGET%%/*}"
 ALIAS="crafting-mac-${SANDBOX}"
 
-# --- read the Mac connection metadata that the jumpbox "owns" ---------------
+# --- resolve the Mac connection metadata from the jumpbox workspace ---------
+# Reads the Mac IP straight from the Terraform resource state (or CS_MAC_HOST)
+# and computes the workspace FQDN (the ProxyJump target) from the workspace's own
+# environment, in a single `cs exec` round-trip. No "publish" step is required.
 fetch_info() {
-  local raw
-  raw="$($CS_BIN exec -W "$TARGET" -- bash -lc 'cat ~/mac/connection.json' 2>/dev/null || true)"
-  [ -n "$raw" ] || die "could not read ~/mac/connection.json on $TARGET. Is the jumpbox running and provisioned?"
-  echo "$raw" | jq -e . >/dev/null 2>&1 || die "connection.json on $TARGET is not valid JSON"
-  MAC_HOST="$(echo "$raw" | jq -r '.macHost // empty')"
-  MAC_USER="$(echo "$raw" | jq -r '.macUser // "ec2-user"')"
-  WS_HOST="$(echo "$raw"  | jq -r '.workspaceHost // empty')"
-  REPO_PATH="$(echo "$raw" | jq -r '.repoPath // empty')"
-  [ -n "$MAC_HOST" ] || die "connection.json missing .macHost"
-  [ -n "$WS_HOST" ]  || die "connection.json missing .workspaceHost (needed for ProxyJump)"
-  [ -n "$REPO_PATH" ] || REPO_PATH="/Users/${MAC_USER}"
+  local remote out
+  # NOTE: keep this a SINGLE LINE. `cs exec -- bash -lc "<arg>"` fails on multi-line
+  # arguments (the newlines break arg framing), so use ';' instead of newlines.
+  remote='if [ -n "${SANDBOX_FOLDER:-}" ]; then SB="$SANDBOX_ID"; else SB="$SANDBOX_NAME"; fi; WSHOST="${SANDBOX_WORKLOAD}--${SB}-${SANDBOX_ORG}${SANDBOX_SYSTEM_DNS_SUFFIX}"; IP="'"$CS_MAC_HOST"'"; [ -n "$IP" ] || IP="$(jq -r ".public_ip // empty" "'"$CS_MAC_STATE"'" 2>/dev/null || true)"; printf "%s\t%s\n" "$IP" "$WSHOST"'
+  out="$($CS_BIN exec -W "$TARGET" -- bash -lc "$remote" 2>/dev/null | tail -1 || true)"
+  [ -n "$out" ] || die "could not read Mac info on $TARGET. Is the workspace running?"
+  IFS=$'\t' read -r MAC_HOST WS_HOST <<<"$out"
+  [ -n "$MAC_HOST" ] || die "no Mac IP found in ${CS_MAC_STATE} on $TARGET (is the 'macos' resource provisioned? set CS_MAC_STATE or CS_MAC_HOST)"
+  [ -n "$WS_HOST" ]  || die "could not compute the workspace FQDN on $TARGET (missing SANDBOX_* env)"
+  MAC_USER="$CS_MAC_USER_DEFAULT"
+  REPO_PATH="${CS_MAC_REPO:-/Users/${MAC_USER}}"
 }
 
 # --- ensure a local keypair for this sandbox -------------------------------
@@ -215,7 +229,9 @@ case "$SUB" in
     fetch_info; ensure_key
     echo "Target          : $TARGET"
     echo "Mac             : ${MAC_USER}@${MAC_HOST}"
+    echo "Mac IP source   : ${CS_MAC_STATE} (on workspace)"
     echo "Jump (workspace): ${WS_HOST}"
+    echo "Repo path (Mac) : ${REPO_PATH}"
     echo "Alias           : ${ALIAS}"
     printf 'Include present : '; grep -qxF "$INCLUDE_LINE" "$MAIN_CONFIG" 2>/dev/null && echo yes || echo "NO (run: cs mac config $TARGET)"
     printf 'Host block      : '; sed -n "/# >>> cs-mac ${ALIAS}/,/# <<< cs-mac ${ALIAS}/p" "$MANAGED_CONFIG" 2>/dev/null | grep -q "Host ${ALIAS}" && echo yes || echo "NO (run: cs mac config $TARGET)"

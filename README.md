@@ -15,6 +15,28 @@ laptop never connects to the Mac directly. The extension makes the Mac feel like
 dev target while routing through the workspace, and hides the SSH plumbing behind one
 command.
 
+## Quickstart
+
+**Already provisioned your Mac with the
+[macOS-in-Crafting-sandbox guide](docs/macos-in-crafting-sandbox.md)?** Then you're done on the
+sandbox side — there are **no template, Terraform, or workspace changes**, and you can ignore
+the `.sandbox/`, `terraform/`, and `scripts/` directories in this repo. The extension reads the
+resource-state file your sandbox already writes. On your laptop (with `cs` logged in, the
+`code` or `cursor` CLI + Remote-SSH extension, and `jq` installed):
+
+```bash
+cs extensions install https://github.com/crafting-demo/ec2-mac.git
+cs mac <sandbox>/dev /Users/ec2-user/my-ios-app   # path = where the build hook puts code on the Mac
+```
+
+First run also bootstraps your laptop's SSH key onto the Mac through the workspace, so there's
+no key distribution to do.
+
+**Starting from scratch (no Mac yet)?** Fork this repo, fill in the `# <-- REPLACE` markers in
+[`.sandbox/template.yaml`](.sandbox/template.yaml) and [`terraform/`](terraform), deploy the
+sandbox, then run the same two commands above. See
+[the reference implementation](#using-with-the-macos-in-crafting-sandbox-guide) below.
+
 ## Install
 
 ```bash
@@ -54,13 +76,23 @@ cs mac my-mac-box/gw src/app    # opens <repoPath>/src/app
 Environment knobs:
 
 - `CS_MAC_IDE=cursor` — launch Cursor instead of VS Code.
+- `CS_MAC_STATE=/path/to/state` — path to the Terraform resource state on the workspace
+  (default `/run/sandbox/fs/resources/macos/state`; change if your resource isn't named `macos`).
+- `CS_MAC_HOST=<ip>` — override the Mac IP/host directly, skipping the state file (use for a
+  VPC-peered private IP that isn't in the state output).
+- `CS_MAC_USER=ec2-user` — login user on the Mac (default `ec2-user`).
+- `CS_MAC_REPO=/Users/ec2-user/my-app` — default folder to open on the Mac when no `PATH`
+  argument is given (default `/Users/<macUser>`).
 - `CS_MAC_PROXY=proxycommand` — use `ProxyCommand cs exec ... nc` instead of the default
   `ProxyJump` (only needed if the workspace sshd blocks `-W` forwarding; `ProxyJump` is the
   recommended default).
 
 ## What it does (per invocation)
 
-1. Reads Mac metadata from the jumpbox: `cs exec -W SANDBOX/WORKSPACE -- cat ~/mac/connection.json`.
+1. Resolves Mac metadata from the jumpbox in one `cs exec` round-trip: reads the Mac IP
+   straight from the Terraform **resource state** (`/run/sandbox/fs/resources/macos/state`, or
+   `CS_MAC_HOST`) and computes the workspace FQDN (the ProxyJump target) from the workspace's
+   own `SANDBOX_*` environment. No "publish" step is needed.
 2. Ensures a local keypair `~/.ssh/crafting-mac/keys/<sandbox>`.
 3. Bootstraps that public key into the Mac's `authorized_keys` **via the jumpbox**
    (the jumpbox SSHes to the Mac and appends the key).
@@ -90,61 +122,72 @@ provide:
    setup the Mac's security group allows SSH only from the Crafting cluster egress CIDR; the
    workspace lives in that cluster.
 
-2. **A metadata file** at `~/mac/connection.json` in the workspace home — see
-   [`examples/connection.json`](examples/connection.json):
+2. **The Mac IP, discoverable on the workspace.** By default the extension reads it from the
+   Terraform **resource state** at `/run/sandbox/fs/resources/macos/state` (the `.public_ip`
+   field). If you provisioned the Mac with the
+   [macOS-in-Crafting-sandbox guide](docs/macos-in-crafting-sandbox.md), this file already
+   exists — there is **nothing extra to publish**. Point at a different path with
+   `CS_MAC_STATE`.
 
-   ```json
-   {
-     "workspaceHost": "gw--<sandbox-id>-<org>.<sys-dns-suffix>",
-     "workspaceUser": "owner",
-     "macHost": "<public-or-private-ip>",
-     "macUser": "ec2-user",
-     "repoPath": "/Users/ec2-user/<repo>"
-   }
-   ```
-
-   - `workspaceHost` is the workspace FQDN used as the `ProxyJump` target — the same host
-     `cs vscode`/`cs ssh` use: `WORKSPACE--SANDBOX-ORG<SysDNSSuffix>` (sandbox **ID** instead
-     of name for folder/detached sandboxes). It is matched by the `Host *-<org><suffix>`
-     block that `cs` auto-writes into `~/.ssh/config`.
-   - `macHost` should be the IP the **workspace** can reach (private IP if VPC-peered, else
-     the public IP).
+   The `ProxyJump` target (the workspace FQDN) is computed from the workspace's own
+   environment — `<workload>--<sandbox>-<org><sys-dns-suffix>`, using the sandbox **ID**
+   instead of the name for folder/detached sandboxes — the same host `cs vscode`/`cs ssh`
+   use, matched by the `Host *-<org><suffix>` block that `cs` auto-writes into `~/.ssh/config`.
 
 3. **The workspace's own SSH identity authorized on the Mac**, so the workspace can perform
    the laptop-key bootstrap (step 3 above). The extension's bootstrap also honors
    `~/.ssh/id_mac` on the workspace if present.
 
+### Overrides for non-default setups
+
+All of these are laptop-side env vars — no file or workspace change needed:
+
+| Situation | Override |
+|---|---|
+| Resource not named `macos` | `CS_MAC_STATE=/run/sandbox/fs/resources/<name>/state` |
+| VPC-peered / private IP not in the state | `CS_MAC_HOST=<ip>` |
+| Mac login user isn't `ec2-user` | `CS_MAC_USER=<user>` |
+| Fixed default folder to open | `CS_MAC_REPO=/Users/<user>/<repo>` (or pass the `PATH` arg) |
+
 ### Mapping to a Terraform-provisioned Mac
 
-If you provision the Mac with Terraform inside the sandbox (a common pattern), the metadata
-the extension needs is exactly what Terraform already outputs:
+If you provision the Mac with Terraform inside the sandbox (a common pattern), everything the
+extension needs already exists — it reads the same outputs the platform already saved:
 
 | Terraform | This extension |
 |---|---|
-| `output { public_ip, instance_id, host_id }` | `~/mac/connection.json` fields |
-| Resource state file in the workspace | `~/mac/connection.json` (same role) |
+| `output { public_ip, instance_id, host_id }` | read directly from the resource state |
+| Resource state file in the workspace (`/run/sandbox/fs/resources/macos/state`) | the default Mac-IP source (`CS_MAC_STATE`) |
 | `user_data` injects the workspace's public key into the Mac | workspace key on the Mac enables bootstrap |
 | Security group: SSH from Crafting egress CIDR | unchanged; workspace reaches Mac:22 |
 
-The only extra workspace step is to **publish `~/mac/connection.json`** (or point the
-extension at your existing resource-state file) and set `repoPath` to the checked-out repo
-on the Mac.
+No extra "publish" step is required: provision the Mac, install the extension, run `cs mac`.
 
 ## Using with the macOS-in-Crafting-sandbox guide
 
 If you provisioned your Mac with the
-[macOS-in-Crafting-sandbox guide](docs/macos-in-crafting-sandbox.md), you only need to add one
-thing: publish `~/mac/connection.json` in the Mac-owning workspace. The simplest way needs no
-new files -- inline a few lines into the existing `build` hook (which already reads the
-Terraform resource state and re-runs on resume). See the
-[guide's `cs mac` section](docs/macos-in-crafting-sandbox.md#connect-vs-code-directly-to-the-mac-with-cs-mac)
-for the exact snippet. [`scripts/publish-connection.sh`](scripts/publish-connection.sh) is an
-optional checked-in alternative.
+[macOS-in-Crafting-sandbox guide](docs/macos-in-crafting-sandbox.md), there is **nothing to
+add in the workspace**. That guide already saves the Terraform output to
+`/run/sandbox/fs/resources/macos/state`, which is exactly where the extension reads the Mac
+IP from. Each developer just installs the extension and runs it:
+
+```bash
+cs extensions install https://github.com/crafting-demo/ec2-mac.git
+cs mac <sandbox>/dev /Users/ec2-user/my-ios-app   # opens VS Code on the Mac, via the jump host
+```
+
+See the [guide's `cs mac` section](docs/macos-in-crafting-sandbox.md#connect-vs-code-directly-to-the-mac-with-cs-mac)
+for details.
+
+Haven't set the Mac up yet? This repo includes the full reference implementation referenced by
+the guide — fork it and fill in the `# <-- REPLACE` markers:
+
+- [`.sandbox/template.yaml`](.sandbox/template.yaml) — the sandbox definition (workspaces + `macos` Terraform resource).
+- [`terraform/`](terraform) — `main.tf`, `variables.tf`, `outputs.tf`, `env.sh` that provision the Dedicated Host + Mac instance.
+- [`scripts/`](scripts) — `setup-ssh.sh`, `sync-code.sh`, `build-ios.sh` for the workspace.
 
 ## Examples
 
-- [`scripts/publish-connection.sh`](scripts/publish-connection.sh) — emit `~/mac/connection.json` from the guide's Terraform resource state (run in the workspace).
-- [`examples/connection.json`](examples/connection.json) — the metadata file the jumpbox must expose.
 - [`examples/jumpbox.sandbox.yaml`](examples/jumpbox.sandbox.yaml) — a minimal jumpbox sandbox definition.
 - [`examples/teardown.sh`](examples/teardown.sh) — parameterized teardown of a CLI-provisioned Mac.
 
