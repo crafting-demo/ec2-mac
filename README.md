@@ -95,7 +95,9 @@ Environment knobs:
    own `SANDBOX_*` environment. No "publish" step is needed.
 2. Ensures a local keypair `~/.ssh/crafting-mac/keys/<sandbox>`.
 3. Bootstraps that public key into the Mac's `authorized_keys` **via the jumpbox**
-   (the jumpbox SSHes to the Mac and appends the key).
+   (the jumpbox SSHes to the Mac and appends the key). This hop runs over `cs ssh`
+   (not `cs exec`) because the workspace's managed SSH agent — the key the Mac
+   trusts — is only available in a `cs ssh` session.
 4. Writes a fenced `Host crafting-mac-<sandbox>` block into `~/.ssh/crafting-mac/config`
    with `ProxyJump <workspaceHost>`.
 5. Smoke-tests `ssh crafting-mac-<sandbox> true`.

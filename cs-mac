@@ -117,13 +117,19 @@ ensure_key() {
 }
 
 # --- install the laptop pubkey on the Mac, via the jumpbox -----------------
+# The workspace authenticates to the Mac with its managed SSH agent key (the key
+# Terraform injects via user_data). That agent is ONLY available over `cs ssh`,
+# NOT `cs exec` -- under `cs exec` the agent has no identities, so the onward ssh
+# to the Mac fails with "Permission denied (publickey)". So this hop must use
+# `cs ssh`. (A `~/.ssh/id_mac` file on the workspace, if present, is still honored
+# for setups that use an explicit key instead of the agent.)
 bootstrap_key() {
   local remote_cmd
-  remote_cmd='read -r PUB; KEY_OPT=""; [ -f "$HOME/.ssh/id_mac" ] && KEY_OPT="-i $HOME/.ssh/id_mac";'
-  remote_cmd+=' printf "%s\n" "$PUB" | ssh $KEY_OPT -o BatchMode=yes -o StrictHostKeyChecking=accept-new'
+  remote_cmd='KEY_OPT=""; [ -f "$HOME/.ssh/id_mac" ] && KEY_OPT="-i $HOME/.ssh/id_mac";'
+  remote_cmd+=' ssh $KEY_OPT -o BatchMode=yes -o StrictHostKeyChecking=accept-new'
   remote_cmd+=' -o UserKnownHostsFile="$HOME/.ssh/known_hosts_mac" -o ConnectTimeout=15 '"${MAC_USER}@${MAC_HOST}"
   remote_cmd+=' "umask 077; mkdir -p ~/.ssh; cat >> ~/.ssh/authorized_keys; sort -u ~/.ssh/authorized_keys -o ~/.ssh/authorized_keys; echo BOOTSTRAP_OK"'
-  if printf '%s\n' "$LAPTOP_PUB" | $CS_BIN exec -W "$TARGET" -- bash -lc "$remote_cmd" 2>/dev/null | grep -q BOOTSTRAP_OK; then
+  if printf '%s\n' "$LAPTOP_PUB" | $CS_BIN ssh -W "$TARGET" -- -T "$remote_cmd" 2>/dev/null | grep -q BOOTSTRAP_OK; then
     c_dim "Installed laptop key on ${MAC_USER}@${MAC_HOST} (via ${TARGET})"
   else
     c_red "Warning: could not auto-install laptop key on the Mac via the jumpbox."
