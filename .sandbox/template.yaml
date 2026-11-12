@@ -2,10 +2,13 @@ overview: |
   # iOS Development with macOS
 
   This sandbox provisions an EC2 Mac instance for iOS builds.
-  Source code is edited in the Crafting workspace and built on the Mac via SSH.
+  The `dev` workspace owns the git checkout (and the coding agent). Mutagen keeps
+  a two-way-synced copy on the Mac, and Mac-only tools run there over SSH.
 
   - **Mac Instance**: click the `macos` resource for connection details
-  - **Build**: run `./scripts/build-ios.sh` in the workspace terminal
+  - **Run anything on the Mac**: `~/infra/scripts/mac-run.sh <command>` (e.g. `xcodebuild -list`)
+  - **Build**: `~/infra/scripts/build-ios.sh <Scheme>` in the workspace terminal
+  - **Sync status**: `~/infra/scripts/mac-run.sh true` flushes the sync, or check the `mac-sync` daemon log
 
 workspaces:
   - name: dev
@@ -13,28 +16,25 @@ workspaces:
       - path: my-ios-app                                # <-- REPLACE with your app directory name
         repo:
           git: https://github.com/myorg/my-ios-app      # <-- REPLACE with your iOS app repo URL
+      - path: infra
+        repo:
+          git: https://github.com/crafting-demo/ec2-mac  # <-- REPLACE with your fork that holds scripts/
         manifest:
           overlays:
             - inline:
                 hooks:
                   build:
-                    cmd: |
-                      set -e
-                      REMOTE=$(jq -r ".public_ip" /run/sandbox/fs/resources/macos/state)
-                      rsync -az --exclude '.git' -e "ssh -o StrictHostKeyChecking=no" \
-                        my-ios-app/ "ec2-user@$REMOTE:~/my-ios-app/"
-                      ssh "ec2-user@$REMOTE" "cd ~/my-ios-app && xcodebuild -scheme MyApp -sdk iphoneos build"  # <-- REPLACE scheme and dir
+                    cmd: ./scripts/install-mutagen.sh
                 daemons:
-                  ssh-tunnel:
+                  mac-sync:
                     run:
-                      cmd: |
-                        REMOTE=$(jq -r ".public_ip" /run/sandbox/fs/resources/macos/state)
-                        ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 \
-                          -N "ec2-user@$REMOTE"
+                      cmd: ./scripts/mac-sync-daemon.sh
     wait_for:
       - macos
     env:
       - AWS_CONFIG_FILE=/run/sandbox/fs/secrets/shared/aws-config
+      - MAC_REPO_DIR=/home/owner/my-ios-app             # <-- REPLACE with /home/owner/<your app directory>
+      # - MAC_SYNC_IGNORES=Pods xcuserdata              # optional extra Mutagen ignore patterns
 
   - name: provisioner
     base_snapshot: oci://us-docker.pkg.dev/crafting-dev/sandbox/shared/workspace:latest
@@ -54,10 +54,11 @@ resources:
       - Public IP: {{output.public_ip}}
       - Instance ID: {{output.instance_id}}
       - Host ID: {{output.host_id}}
+      - Data volume: {{output.data_volume_id}} (mounted at `/Volumes/crafting-data`)
 
-      Connect from the workspace terminal:
+      Connect from the `dev` workspace terminal:
       ```
-      ssh ec2-user@{{output.public_ip}}
+      ssh mac
       ```
 
       Resource state: `/run/sandbox/fs/resources/macos/state`
@@ -68,9 +69,8 @@ resources:
       save_state: true
       run:
         timeout: 30m0s
-      # Specifying on_suspend automatically enables on_resume (terraform apply
-      # with suspended=false), so on_resume is not a separate field.
-      on_suspend:
-        vars:
-          suspended: "true"
+      # The Mac keeps running through suspend, so on_suspend changes nothing. It
+      # still has to be present: it's what enables the `terraform apply` on
+      # resume, which repairs drift and refreshes the saved resource state.
+      on_suspend: {}
       on_delete: {}

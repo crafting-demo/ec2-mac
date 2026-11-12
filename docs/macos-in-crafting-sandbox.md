@@ -1,8 +1,12 @@
 # macOS in a Crafting Sandbox
 
-Use an AWS EC2 Mac instance as a managed resource inside a Crafting sandbox for iOS development. The sandbox dynamically provisions a Mac Dedicated Host and instance via Terraform, gives your workspace SSH access, and tears everything down on sandbox deletion. Your developers write and edit code in a Crafting workspace and invoke Xcode CLI tools on the Mac over SSH to build and compile iOS apps.
+Use an AWS EC2 Mac instance as a managed resource inside a Crafting sandbox for iOS development. The sandbox dynamically provisions a Mac Dedicated Host, instance, and persistent data volume via Terraform, gives your workspace SSH access, and tears everything down on sandbox deletion.
+
+The Crafting workspace is the source of truth: it owns the git checkout, the git credentials, and the coding agent. [Mutagen](https://mutagen.io) keeps a two-way-synced copy of the repo on the Mac, and anything that needs macOS (`xcodebuild`, `xcrun simctl`, the simulator) runs there over SSH. No git credentials ever reach the Mac.
 
 This guide covers the full setup: Terraform configuration, sandbox YAML definition, workspace scripts, and optional remote desktop access.
+
+> **Don't delete these sandboxes within 24 hours of creating them.** AWS won't release a Mac Dedicated Host until it has been allocated for 24 hours, so an early delete gets stuck. See [Troubleshooting](#terraform-destroy-fails-within-24-hours-of-host-allocation).
 
 ## Prerequisites
 
@@ -76,6 +80,8 @@ Start with `mac2.metal` for initial testing, then scale up based on build perfor
 
 Allocate at least **200 GB** of EBS storage. Xcode alone requires ~35 GB, plus space for build caches, DerivedData, and your project.
 
+This setup uses two volumes: a 200 GB root volume for macOS and Xcode, and a separate persistent **data volume** (`data_volume_size`, default 200 GB) for the synced repo and DerivedData. The data volume survives instance replacement (for example, an AMI change) and is destroyed with the sandbox.
+
 ### Further Reading
 
 - [AWS EC2 Mac Instances Documentation](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-mac-instances.html)
@@ -94,16 +100,23 @@ repo** — the sections below explain each one and link to it; fork the repo and
   template.yaml          # Sandbox definition (workspaces, resources, endpoints)
 terraform/
   env.sh                 # Exports sandbox env vars for Terraform
-  main.tf                # Dedicated Host + EC2 Mac instance
+  main.tf                # Dedicated Host + EC2 Mac instance + data volume
   variables.tf           # Configurable inputs (instance type, AMI, region)
-  outputs.tf             # IP, instance ID, host ID -> becomes resource state
+  outputs.tf             # IP, instance/host/volume IDs -> becomes resource state
 scripts/
-  setup-ssh.sh           # Configure SSH access to the Mac from the workspace
-  sync-code.sh           # Rsync source code to the Mac
-  build-ios.sh           # Run xcodebuild remotely via SSH
+  mac-env.sh             # Shared settings (paths, SSH alias, session name)
+  setup-ssh.sh           # Configure `ssh mac` from the workspace
+  mac-prepare-volume.sh  # Format/mount the data volume on the Mac
+  install-mutagen.sh     # Install the pinned Mutagen release
+  mac-sync-daemon.sh     # Crafting daemon: Mutagen sync workspace <-> Mac
+  mac-run.sh             # Run a command on the Mac (flushes the sync first)
+  build-ios.sh           # xcodebuild on the Mac via mac-run.sh
+examples/
+  agents-snippet.md      # Copy into your app repo's AGENTS.md
+  sweep-orphans.sh       # Clean up resources left by deleted sandboxes
 ```
 
-The Terraform files provision the Mac infrastructure. The scripts run inside the Crafting workspace and interact with the Mac over SSH. The sandbox YAML ties them together with lifecycle handlers.
+The Terraform files provision the Mac infrastructure. The scripts run inside the Crafting workspace and interact with the Mac over SSH. The sandbox YAML ties them together with lifecycle handlers and a sync daemon.
 
 > **Important:** The shell scripts are already committed executable. If you add your own, make them executable: `chmod +x terraform/env.sh scripts/*.sh`
 
@@ -111,7 +124,7 @@ The Terraform files provision the Mac infrastructure. The scripts run inside the
 
 ## Terraform Configuration
 
-The Terraform module manages the full lifecycle of the Mac instance: allocate a Dedicated Host, launch an instance, inject SSH keys, and clean up on destroy. The suspend/resume strategy terminates the instance but keeps the Dedicated Host to avoid re-triggering the 24-hour billing minimum.
+The Terraform module manages the full lifecycle of the Mac: allocate a Dedicated Host, launch an instance, attach a persistent data volume, inject SSH keys, and clean up on destroy. Everything keeps running while the sandbox is suspended (see [Suspend/Resume Strategy](#suspendresume-strategy)).
 
 ### env.sh — [`terraform/env.sh`](../terraform/env.sh)
 
@@ -126,15 +139,15 @@ EOF
 
 ### variables.tf — [`terraform/variables.tf`](../terraform/variables.tf)
 
-Declares the configurable inputs: `instance_type` (default `mac2.metal`), `ami_id`, `availability_zone`, `vpc_id`, `subnet_id`, and `suspended` (the suspend/resume toggle). See the [Required Terraform Variables](#required-terraform-variables) table above.
+Declares the configurable inputs: `instance_type` (default `mac2.metal`), `ami_id`, `availability_zone`, `vpc_id`, `subnet_id`, `ssh_ingress_cidrs` (default `0.0.0.0/0`; set it to your Crafting egress CIDR), and `data_volume_size` (default 200 GB). See the [Required Terraform Variables](#required-terraform-variables) table above. The old `suspended` variable is still declared so older templates that pass it don't fail, but it's ignored.
 
 ### main.tf — [`terraform/main.tf`](../terraform/main.tf)
 
 Provisions the full lifecycle. The key pieces:
 
-- A **Dedicated Host** (`aws_ec2_host.mac`) that persists across suspend/resume.
-- A **security group** (open to `0.0.0.0/0` in the example — lock this down to your Crafting egress CIDR for production; see [Security](#security)).
-- The **Mac instance** (`aws_instance.mac`), gated by `count = var.suspended ? 0 : 1` so suspend terminates it while the host persists. Its `user_data` injects the workspace key:
+- A **Dedicated Host** (`aws_ec2_host.mac`) that lives until the sandbox is deleted.
+- A **security group** allowing SSH from `ssh_ingress_cidrs` (default `0.0.0.0/0` — set this to your Crafting egress CIDR for production; see [Security](#security)).
+- The **Mac instance** (`aws_instance.mac`), which keeps running through suspend/resume. `user_data` changes are ignored after first boot, because updating them in place would stop the instance and trigger a host scrub. Its `user_data` injects the workspace key:
 
   ```hcl
   user_data = <<-EOT
@@ -146,6 +159,7 @@ Provisions the full lifecycle. The key pieces:
   EOT
   ```
 
+- A persistent **data volume** (`aws_ebs_volume.data`) attached at `/dev/sdf` (`aws_volume_attachment.data`). It's a separate resource from the instance, so it survives instance replacement, and the instance depends on it so that `terraform destroy` terminates the instance before deleting the volume. The attachment uses `skip_destroy` so Terraform never force-detaches a mounted volume from a running Mac.
 - A `null_resource.wait_for_ssh` that blocks until the Mac accepts SSH.
 
 ### outputs.tf — [`terraform/outputs.tf`](../terraform/outputs.tf)
@@ -155,25 +169,27 @@ The `output` block aggregates all values into a single object. The Crafting reso
 ```hcl
 output "output" {
   value = {
-    public_ip   = length(aws_instance.mac) > 0 ? aws_instance.mac[0].public_ip : null
-    instance_id = length(aws_instance.mac) > 0 ? aws_instance.mac[0].id : null
-    host_id     = aws_ec2_host.mac.id
+    public_ip      = aws_instance.mac.public_ip
+    instance_id    = aws_instance.mac.id
+    host_id        = aws_ec2_host.mac.id
+    data_volume_id = aws_ebs_volume.data.id
   }
 }
 ```
 
 ### Suspend/Resume Strategy
 
-The Terraform configuration implements a cost-aware suspend/resume strategy:
+The Mac keeps running while the sandbox is suspended. Suspend and resume don't touch the host, the instance, or the data volume:
 
-- **Dedicated Host** (`aws_ec2_host.mac`): Always persists. This is the physical Mac mini hardware. It keeps billing at the hourly rate (~$1.08/hr for mac2.metal) regardless of whether an instance is running.
-- **Instance** (`aws_instance.mac`): Uses `count = var.suspended ? 0 : 1`. On suspend, Terraform terminates the instance. On resume, it launches a new one on the same host.
-- **On delete**: `terraform destroy` removes both the instance and the Dedicated Host.
+- **Dedicated Host** (`aws_ec2_host.mac`): the physical Mac mini. It bills at the hourly rate (~$1.08/hr for mac2.metal) whether or not an instance is running, and you can't release it during the first 24 hours anyway.
+- **Instance** (`aws_instance.mac`): free on a Dedicated Host. Keeping it running costs only its root volume (about $16/month for 200 GB of gp3).
+- **On delete**: `terraform destroy` terminates the instance, then deletes the data volume, security group, and Dedicated Host.
 
-This means:
-- **Resume is fast** (~2-5 minutes to boot a new instance) vs. reallocating a host (~10-20 minutes).
-- **The 24-hour billing minimum is not re-triggered** on resume since the host was never released.
-- **The host costs money while the sandbox is suspended.** For long idle periods (weekends, overnight), deleting the sandbox entirely may be more cost-effective.
+Why not terminate the instance on suspend? Stopping or terminating a Mac instance makes AWS **scrub the Dedicated Host** before it can run another instance, which can take a long time. Terminating would also change the Mac's IP and SSH host key and throw away warm Xcode, simulator, and DerivedData caches, all to save about $16/month.
+
+On suspend, the platform still runs `terraform apply` (with nothing to change), because that's what enables the `terraform apply` on resume. The resume apply repairs any drift (for example, if the instance was replaced) and refreshes the saved resource state.
+
+**The host costs money while the sandbox is suspended.** For long idle periods (weeks, end of a project), delete the sandbox to release the host.
 
 ---
 
@@ -183,7 +199,7 @@ The sandbox definition ties the Terraform resource, workspace, and lifecycle tog
 
 > **Before deploying:** Search for `# <-- REPLACE` comments in [`.sandbox/template.yaml`](../.sandbox/template.yaml) and substitute your actual values (repo URLs, scheme name, directory names).
 
-It has two workspaces and one resource: the `dev` workspace edits code and builds on the Mac (with `wait_for: [macos]` so it doesn't start until the Mac is ready), and the `provisioner` workspace checks out this repo's `terraform/` (into `infra`) and runs it. The `macos` resource wires Terraform into the sandbox lifecycle:
+It has two workspaces and one resource: the `dev` workspace owns the app checkout and syncs it to the Mac (with `wait_for: [macos]` so it doesn't start until the Mac is ready), and the `provisioner` workspace checks out this repo's `terraform/` (into `infra`) and runs it. The `macos` resource wires Terraform into the sandbox lifecycle:
 
 ```yaml
 resources:
@@ -196,56 +212,95 @@ resources:
       save_state: true            # -> /run/sandbox/fs/resources/macos/state
       run:
         timeout: 30m0s
-      # Specifying on_suspend automatically enables resume (terraform apply with
-      # suspended=false); there is no separate on_resume field.
-      on_suspend:
-        vars:
-          suspended: "true"
+      # The Mac keeps running through suspend, so on_suspend changes nothing. It
+      # still has to be present: it's what enables the `terraform apply` on
+      # resume, which repairs drift and refreshes the saved resource state.
+      on_suspend: {}
       on_delete: {}
 ```
 
-The `dev` workspace's `build` hook reads the Mac IP from the resource state and rsyncs + `xcodebuild`s over SSH; an `ssh-tunnel` daemon keeps a persistent connection. See the full file for both.
+The `dev` workspace also checks out this repo (into `infra`) for its scripts. That checkout's manifest installs Mutagen in its `build` hook and runs a `mac-sync` daemon (`scripts/mac-sync-daemon.sh`). Set `MAC_REPO_DIR` in the `dev` workspace's `env` to your app checkout. See the full file.
 
 ### How It Works
 
-1. **Sandbox creation**: The `provisioner` workspace checks out the Terraform code. The Crafting platform runs `terraform init && terraform apply -auto-approve` in the `infra/terraform` directory, allocating a Dedicated Host and launching a Mac instance. The JSON output is saved to `/run/sandbox/fs/resources/macos/state`.
+1. **Sandbox creation**: The `provisioner` workspace checks out the Terraform code. The Crafting platform runs `terraform init && terraform apply -auto-approve` in the `infra/terraform` directory, allocating a Dedicated Host, creating the data volume, and launching a Mac instance with the volume attached. The JSON output is saved to `/run/sandbox/fs/resources/macos/state`.
 
-2. **Workspace startup**: The `dev` workspace has `wait_for: [macos]`, so its daemons and build hooks don't start until Terraform completes. The `build` hook rsyncs source code to the Mac and runs `xcodebuild`. The `ssh-tunnel` daemon maintains a persistent SSH connection.
+2. **Workspace startup**: The `dev` workspace has `wait_for: [macos]`, so its daemons and build hooks don't start until Terraform completes. The `mac-sync` daemon configures `ssh mac`, formats and mounts the data volume on first use, and starts a Mutagen session between `MAC_REPO_DIR` and `/Volumes/crafting-data/<repo>` on the Mac.
 
-3. **Suspend**: The platform runs `terraform apply -auto-approve -var suspended=true`, which terminates the Mac instance but keeps the Dedicated Host.
+3. **Suspend**: The platform runs `terraform apply -auto-approve`, which changes nothing. The Mac, its data volume, and the Mutagen session state all stay as they are; syncing simply pauses while the workspace is down.
 
-4. **Resume**: Specifying `on_suspend` automatically enables resume, so the platform runs `terraform apply -auto-approve` (suspended defaults to false), launching a new instance on the same host. The `dev` workspace waits for the resource, then re-runs its build hook and restarts daemons.
+4. **Resume**: The platform runs `terraform apply -auto-approve` again, which repairs any drift and refreshes the resource state. The `mac-sync` daemon restarts and Mutagen reconciles whatever changed on either side.
 
-5. **Delete**: The platform runs `terraform destroy -auto-approve`, terminating the instance and releasing the Dedicated Host. Note: if the Dedicated Host has been allocated for less than 24 hours, the destroy will fail (see [Troubleshooting](#troubleshooting)).
+5. **Delete**: The platform runs `terraform destroy -auto-approve`, terminating the instance, then deleting the data volume and security group and releasing the Dedicated Host. If the Dedicated Host has been allocated for less than 24 hours, the destroy will fail (see [Troubleshooting](#terraform-destroy-fails-within-24-hours-of-host-allocation)).
 
 ---
 
 ## Workspace Scripts
 
-These scripts run inside the `dev` workspace and interact with the Mac over SSH. All of them
-read the Mac's IP from the resource state file (`/run/sandbox/fs/resources/macos/state`). They
-are committed in [`scripts/`](../scripts) (already executable).
+These scripts run inside the `dev` workspace (checked out at `~/infra`) and interact with the
+Mac over SSH. They share their settings through [`scripts/mac-env.sh`](../scripts/mac-env.sh);
+every value can be overridden from the workspace `env`. They are committed in
+[`scripts/`](../scripts) (already executable).
 
-- **[`scripts/setup-ssh.sh`](../scripts/setup-ssh.sh)** — writes a `Host mac` entry into
-  `~/.ssh/config` pointing at the Mac's IP, so you can just `ssh mac` from the workspace.
-- **[`scripts/sync-code.sh`](../scripts/sync-code.sh)** `[PROJECT_DIR]` — rsyncs a local
-  directory to `~/<dir>` on the Mac (excludes `.git`, `DerivedData`, `build`).
-- **[`scripts/build-ios.sh`](../scripts/build-ios.sh)** `[SCHEME] [PROJECT_DIR]` — syncs, then
-  runs `xcodebuild -scheme <SCHEME> -sdk iphoneos -configuration Release build` over SSH. To
-  pull back artifacts, rsync `~/<dir>/build/Release-iphoneos/` from the Mac.
+- **[`scripts/setup-ssh.sh`](../scripts/setup-ssh.sh)** — writes a fenced `Host mac` block at the
+  top of `~/.ssh/config` pointing at the Mac's IP, so you can just `ssh mac` from the workspace.
+  The rest of `~/.ssh/config` is left alone.
+- **[`scripts/mac-prepare-volume.sh`](../scripts/mac-prepare-volume.sh)** — finds the data volume
+  on the Mac by its NVMe serial (the EBS volume ID), formats it as APFS only if it's blank,
+  mounts it at `/Volumes/crafting-data`, links `~/<repo>` to the synced copy, and points
+  Xcode's DerivedData there.
+- **[`scripts/install-mutagen.sh`](../scripts/install-mutagen.sh)** — installs the pinned Mutagen
+  release (`MUTAGEN_VERSION`).
+- **[`scripts/mac-sync-daemon.sh`](../scripts/mac-sync-daemon.sh)** — the `mac-sync` daemon. Runs
+  the three scripts above, then keeps a Mutagen session (`mac-repo`) running.
+- **[`scripts/mac-run.sh`](../scripts/mac-run.sh)** `COMMAND [ARGS...]` — flushes the sync, runs
+  the command on the Mac from the repo root (in a login shell), then flushes again so any
+  files it wrote come back. Exits with the command's status.
+- **[`scripts/build-ios.sh`](../scripts/build-ios.sh)** `[SCHEME] [xcodebuild args...]` — runs
+  `xcodebuild ... -derivedDataPath /Volumes/crafting-data/DerivedData build` through `mac-run.sh`.
+  Build products stay on the Mac; copy them with
+  `scp -r mac:/Volumes/crafting-data/DerivedData/Build/Products/Release-iphoneos ./build-output/`.
 
-> The `dev` workspace's `build` hook in [`.sandbox/template.yaml`](../.sandbox/template.yaml)
-> performs the sync + build automatically; these scripts are for running the same steps by
-> hand from the workspace terminal.
+### How the sync works
+
+- **The workspace is the source of truth.** Git, git credentials, branch selection, and the
+  coding agent all live in the workspace. Commit and push from the workspace as usual.
+- **Mutagen runs in `two-way-resolved` mode with the workspace winning conflicts.** Edits made
+  in the workspace reach the Mac within seconds. Files created or changed on the Mac (for
+  example `Package.resolved` or snapshot test reference images) sync back.
+- **Not synced:** `.git` and other version-control directories, `DerivedData`, `build`, `.build`,
+  and `.DS_Store`. Add more with `MAC_SYNC_IGNORES` (space-separated, e.g. `Pods xcuserdata`).
+  The daemon labels the session with a hash of its settings and recreates it automatically
+  when they change.
+- **Never run `git` on the Mac.** The Mac copy has no `.git` directory.
+- **Check sync status** from the workspace with
+  `~/.local/share/ec2-mac/mutagen-*/mutagen sync list mac-repo`, or look at the `mac-sync`
+  daemon's log.
+
+### Coding agents
+
+Run the agent in the `dev` workspace, next to the git checkout. It edits files there and uses
+`mac-run.sh` for anything that needs macOS:
+
+```bash
+~/infra/scripts/mac-run.sh xcodebuild -list
+~/infra/scripts/build-ios.sh MyApp
+~/infra/scripts/mac-run.sh xcrun simctl io booted screenshot screenshot.png   # lands in the workspace
+```
+
+Copy [`examples/agents-snippet.md`](../examples/agents-snippet.md) into your app repo's
+`AGENTS.md` (or equivalent) so the agent knows to do this.
 
 ---
 
 ## Connect VS Code directly to the Mac with `cs mac`
 
-The build-over-SSH workflow above edits code in the Linux workspace and compiles on the Mac.
-If you'd rather **edit and run directly on the Mac** -- source code on the Mac, VS Code (or
-Cursor) Remote-SSH attached to the Mac, Xcode/simulator/snapshot tests all local to the Mac --
-use the [`cs mac`](https://github.com/crafting-demo/ec2-mac) CLI extension.
+The workflow above edits code in the Linux workspace and builds on the Mac. When you want to
+**work on the Mac itself** -- VS Code (or Cursor) Remote-SSH attached to the Mac, with
+Xcode/simulator/snapshot tests local to it -- use the
+[`cs mac`](https://github.com/crafting-demo/ec2-mac) CLI extension and open the synced copy of
+the repo. Edits you make there sync back to the workspace. The workspace is still the source
+of truth: the Mac copy has no `.git`, so commit and push from the workspace.
 
 Because the Mac's security group only allows SSH from the Crafting cluster egress IPs, the
 developer laptop never connects to the Mac directly. `cs mac` routes through this sandbox's
@@ -275,7 +330,7 @@ So the only step is on the developer's laptop. Each developer installs the exten
 ```bash
 cs extensions install https://github.com/crafting-demo/ec2-mac.git
 
-# open the repo that the build hook rsyncs to on the Mac:
+# open the synced copy of the repo on the Mac (~/my-ios-app links to /Volumes/crafting-data/my-ios-app):
 cs mac <sandbox>/dev /Users/ec2-user/my-ios-app
 ```
 
@@ -346,20 +401,20 @@ Use SSH for all build and compile workflows. Reserve VNC for tasks that genuinel
 
 ### Cost
 
-EC2 Mac Dedicated Hosts have a **24-hour minimum billing period**. At approximately $1.08/hr for `mac2.metal`, that is ~$26/day minimum per host. The suspend/resume strategy (keep host, terminate instance) avoids re-triggering this minimum on resume but means you continue paying for the host while the sandbox is suspended.
+EC2 Mac Dedicated Hosts have a **24-hour minimum billing period**. At approximately $1.08/hr for `mac2.metal`, that is ~$26/day minimum per host. The instance itself is free on the host, so keeping it running through suspend only adds its EBS storage: about $16/month for the 200 GB root volume, plus the data volume (about $16/month at the default 200 GB), which you'd keep anyway.
 
-**Guidance for teams**: For active development (daily use), suspend and resume freely -- the host cost is constant. For longer idle periods (weekends, end of sprint), delete the sandbox entirely to release the host and stop billing.
+**Guidance for teams**: For active development (daily use), suspend and resume freely -- the host cost is constant and resume is quick. For long idle periods (weeks, end of a project), delete the sandbox entirely to release the host and stop billing.
 
-### Suspend/Resume Strategy
+### Suspend vs. Delete
 
-| | Suspend (keep host) | Delete (release everything) |
+| | Suspend | Delete (release everything) |
 |---|---|---|
-| Resume speed | ~2-5 min (launch instance on existing host) | ~10-20 min (allocate host + launch instance) |
-| Cost while idle | ~$1.08/hr (host running, no instance) | $0 |
-| Risk on resume | None | May fail if no host capacity; new 24h minimum |
-| Build caches | Preserved on EBS | Lost unless using a persistent EBS volume |
+| Resume / recreate speed | Fast: the Mac never stopped; Mutagen reconnects | ~10-20 min (allocate host + launch instance) |
+| Cost while idle | ~$1.08/hr host + EBS storage | $0 |
+| Risk | None | May fail if no host capacity; new 24h minimum |
+| Repo copy, DerivedData, caches | Preserved | Lost (re-synced and rebuilt from the workspace on the next sandbox) |
 
-The Terraform configuration in this guide implements the "keep host" strategy via the `suspended` variable.
+The Terraform configuration in this guide keeps the host, instance, and data volume through suspend; see [Suspend/Resume Strategy](#suspendresume-strategy).
 
 ### AMI Selection
 
@@ -400,7 +455,8 @@ env:
 
 ### Security
 
-- Lock down the security group to allow SSH only from your Crafting cluster's egress IP range, not `0.0.0.0/0`. Consult your Crafting admin for the egress CIDR.
+- Lock down the security group to allow SSH only from your Crafting cluster's egress IP range, not `0.0.0.0/0`: set the `ssh_ingress_cidrs` Terraform variable (e.g. `ssh_ingress_cidrs = ["203.0.113.0/24"]` in `terraform.tfvars`, or `TF_VAR_ssh_ingress_cidrs=["203.0.113.0/24"]` in the provisioner workspace `env`). Consult your Crafting admin for the egress CIDR. This matters more now that the Mac keeps running while the sandbox is suspended.
+- Git credentials stay in the workspace. The Mac only receives the synced working tree (no `.git`), so nothing on it can push to your git host.
 - If the Crafting cluster and Mac instances are in the same AWS account, consider VPC peering for private-IP connectivity (no public IP needed).
 - If using VNC, restrict port 5900 to the same security group rules. Prefer SSH tunneling over opening VNC directly.
 
@@ -422,7 +478,16 @@ env:
 
 AWS enforces a **24-hour minimum allocation** for Mac Dedicated Hosts. If a user deletes the sandbox less than 24 hours after creation, `terraform destroy` will exit with code 1 because the Dedicated Host cannot be released yet. The sandbox will remain stuck in a "deleting" state until the host ages past 24 hours.
 
-**Workaround:** Advise users not to delete sandboxes within 24 hours of creation. If a sandbox is stuck deleting, wait until the 24-hour window has elapsed and retry the delete, or manually release the Dedicated Host in the AWS console once the minimum period has passed.
+**Workaround:** Advise users not to delete sandboxes within 24 hours of creation. If a sandbox is stuck deleting, wait until the 24-hour window has elapsed and retry the delete.
+
+If the sandbox is already gone but its AWS resources were left behind (for example, it was force-removed), use [`examples/sweep-orphans.sh`](../examples/sweep-orphans.sh). It lists every resource tagged `ManagedBy=crafting-sandbox` and `Name=crafting-mac-*`, and marks a resource orphaned when its `SandboxID` tag no longer matches a sandbox in `cs sandbox list`. Resources of live sandboxes are never touched. It's a dry run by default:
+
+```bash
+REGION=us-west-2 bash examples/sweep-orphans.sh           # report only
+REGION=us-west-2 bash examples/sweep-orphans.sh --apply   # clean up orphans
+```
+
+With `--apply` it terminates orphaned instances, deletes their data volumes and security groups, and releases orphaned hosts that are past the 24-hour minimum. Younger hosts are reported with how long until they can be released; re-run it then. If several Crafting orgs share the AWS account, set `ORGS="org-a org-b"` so sandboxes in every org count as live.
 
 ### `terraform apply` hangs during mac2 host creation (insufficient AZ capacity)
 

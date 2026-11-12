@@ -21,7 +21,7 @@ provider "aws" {
   }
 }
 
-# --- Dedicated Host (persists across suspend/resume) ---
+# --- Dedicated Host (lives until the sandbox is deleted) ---
 
 resource "aws_ec2_host" "mac" {
   instance_type     = var.instance_type
@@ -35,11 +35,12 @@ resource "aws_ec2_host" "mac" {
 
 # --- Security Group ---
 #
-# NOTE: The example below opens SSH to 0.0.0.0/0 for simplicity. For production,
-# lock ingress down to your Crafting cluster's egress CIDR (see the guide's
-# "Security" section). The `cs mac` extension only needs workspace -> Mac:22,
-# which originates from a Crafting egress IP, so an egress-only allowlist is
-# sufficient and recommended.
+# NOTE: `ssh_ingress_cidrs` defaults to 0.0.0.0/0 for simplicity. For production,
+# set it to your Crafting cluster's egress CIDR (see the guide's "Security"
+# section). The Mac keeps running while the sandbox is suspended, so it stays
+# reachable even when nobody is using it. The `cs mac` extension and the
+# workspace sync only need workspace -> Mac:22, which originates from a Crafting
+# egress IP, so an egress-only allowlist is sufficient and recommended.
 
 resource "aws_security_group" "mac" {
   name_prefix = "crafting-mac-"
@@ -50,7 +51,7 @@ resource "aws_security_group" "mac" {
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    cidr_blocks = var.ssh_ingress_cidrs
   }
 
   egress {
@@ -65,11 +66,13 @@ resource "aws_security_group" "mac" {
   }
 }
 
-# --- Mac Instance (terminated on suspend, re-created on resume) ---
+# --- Mac Instance (kept running through suspend/resume) ---
+#
+# Stopping or terminating a Mac instance triggers a scrub of the Dedicated Host,
+# and the instance itself is free on a Dedicated Host, so the instance stays up
+# for the life of the sandbox.
 
 resource "aws_instance" "mac" {
-  count = var.suspended ? 0 : 1
-
   ami                    = var.ami_id
   instance_type          = var.instance_type
   host_id                = aws_ec2_host.mac.id
@@ -94,20 +97,53 @@ resource "aws_instance" "mac" {
   tags = {
     Name = "crafting-mac-${data.external.env.result.sandbox_name}"
   }
+
+  # Destroy the instance before the data volume: the volume can't be deleted
+  # while it's still attached to a terminating instance.
+  depends_on = [aws_ebs_volume.data]
+
+  lifecycle {
+    # Updating user_data in place stops and restarts the instance, which
+    # triggers a host scrub. It only matters on first boot anyway.
+    ignore_changes = [user_data]
+  }
+}
+
+# --- Persistent data volume (repo + DerivedData) ---
+#
+# Separate from the instance so it survives instance replacement (e.g. an AMI
+# change). Destroyed with the rest of the sandbox on delete.
+
+resource "aws_ebs_volume" "data" {
+  availability_zone = var.availability_zone
+  size              = var.data_volume_size
+  type              = "gp3"
+
+  tags = {
+    Name = "crafting-mac-data-${data.external.env.result.sandbox_name}"
+  }
+}
+
+resource "aws_volume_attachment" "data" {
+  device_name = "/dev/sdf"
+  volume_id   = aws_ebs_volume.data.id
+  instance_id = aws_instance.mac.id
+
+  # Don't force-detach a mounted APFS volume from a running Mac. Terminating the
+  # instance releases the volume on its own.
+  skip_destroy = true
 }
 
 # --- Wait for SSH to become available ---
 
 resource "null_resource" "wait_for_ssh" {
-  count = var.suspended ? 0 : 1
-
   depends_on = [aws_instance.mac]
 
   provisioner "remote-exec" {
     connection {
       type    = "ssh"
       user    = "ec2-user"
-      host    = aws_instance.mac[0].public_ip
+      host    = aws_instance.mac.public_ip
       agent   = true
       timeout = "10m"
     }

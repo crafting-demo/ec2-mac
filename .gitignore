@@ -5,6 +5,11 @@ id_*
 known_hosts*
 .ssh/
 
+# terraform working files / local state (may contain secrets)
+.terraform/
+*.tfstate
+*.tfstate.*
+
 # editor / OS
 .DS_Store
 *.swp

@@ -1,25 +1,29 @@
 #!/bin/bash
-# Build an iOS project on the Mac and (optionally) pull back artifacts.
-set -e
+# Build an iOS scheme on the Mac from the workspace.
+#
+#   build-ios.sh [SCHEME] [extra xcodebuild args...]
+#
+# Code reaches the Mac through the Mutagen sync (mac-run.sh flushes it first).
+# DerivedData lives on the persistent data volume, so incremental builds stay
+# warm across suspend/resume and instance replacement.
+set -euo pipefail
 
-REMOTE=$(jq -r ".public_ip" /run/sandbox/fs/resources/macos/state)
-SCHEME="${1:-MyApp}"
-PROJECT_DIR="${2:-my-ios-app}"
+here=$(cd "$(dirname "$0")" && pwd)
+source "$here/mac-env.sh"
 
-echo "==> Syncing code to Mac..."
-rsync -az --delete \
-  --exclude '.git' \
-  --exclude 'DerivedData' \
-  --exclude 'build' \
-  -e "ssh -o StrictHostKeyChecking=no" \
-  "$PROJECT_DIR/" "ec2-user@$REMOTE:~/$PROJECT_DIR/"
+SCHEME="${1:-MyApp}"   # <-- REPLACE with your scheme
+shift || true
 
 echo "==> Building $SCHEME on Mac..."
-ssh -o StrictHostKeyChecking=no "ec2-user@$REMOTE" \
-  "cd ~/$PROJECT_DIR && xcodebuild -scheme $SCHEME -sdk iphoneos -configuration Release build"
+"$here/mac-run.sh" xcodebuild \
+  -scheme "$SCHEME" \
+  -sdk iphoneos \
+  -configuration Release \
+  -derivedDataPath "$MAC_DERIVED_DATA" \
+  "$@" \
+  build
 
 echo "==> Build complete."
 
-# To pull back artifacts (e.g. the .app or .ipa):
-#   rsync -az -e "ssh -o StrictHostKeyChecking=no" \
-#     "ec2-user@$REMOTE:~/$PROJECT_DIR/build/Release-iphoneos/" "./build-output/"
+# Build products are not synced back. To copy them to the workspace:
+#   scp -r "$MAC_HOST_ALIAS:$MAC_DERIVED_DATA/Build/Products/Release-iphoneos" ./build-output/
