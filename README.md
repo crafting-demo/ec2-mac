@@ -26,11 +26,16 @@ resource-state file your sandbox already writes. On your laptop (with `cs` logge
 
 ```bash
 cs extensions install https://github.com/crafting-demo/ec2-mac.git
-cs mac <sandbox>/dev /Users/ec2-user/my-ios-app   # path = where the build hook puts code on the Mac
+cs mac <sandbox>/dev /Users/ec2-user/my-ios-app   # path = the synced copy of the repo on the Mac
 ```
 
 First run also bootstraps your laptop's SSH key onto the Mac through the workspace, so there's
 no key distribution to do.
+
+With the reference implementation, the workspace is the source of truth and Mutagen keeps a
+copy of the repo on the Mac at `/Volumes/crafting-data/<repo>` (linked from `~/<repo>`). Edits
+you make through `cs mac` sync back to the workspace. The Mac copy has no `.git`, so commit and
+push from the workspace.
 
 **Starting from scratch (no Mac yet)?** Fork this repo, fill in the `# <-- REPLACE` markers in
 [`.sandbox/template.yaml`](.sandbox/template.yaml) and [`terraform/`](terraform), deploy the
@@ -184,14 +189,16 @@ for details.
 Haven't set the Mac up yet? This repo includes the full reference implementation referenced by
 the guide — fork it and fill in the `# <-- REPLACE` markers:
 
-- [`.sandbox/template.yaml`](.sandbox/template.yaml) — the sandbox definition (workspaces + `macos` Terraform resource).
-- [`terraform/`](terraform) — `main.tf`, `variables.tf`, `outputs.tf`, `env.sh` that provision the Dedicated Host + Mac instance.
-- [`scripts/`](scripts) — `setup-ssh.sh`, `sync-code.sh`, `build-ios.sh` for the workspace.
+- [`.sandbox/template.yaml`](.sandbox/template.yaml) — the sandbox definition (workspaces, `mac-sync` daemon, `macos` Terraform resource).
+- [`terraform/`](terraform) — `main.tf`, `variables.tf`, `outputs.tf`, `env.sh` that provision the Dedicated Host, the Mac instance (kept running through suspend), and a persistent data volume.
+- [`scripts/`](scripts) — workspace scripts: `mac-sync-daemon.sh` (Mutagen sync of the workspace checkout to the Mac), `mac-run.sh` (run a command on the Mac), `build-ios.sh`, plus the setup helpers they use.
 
 ## Examples
 
 - [`examples/jumpbox.sandbox.yaml`](examples/jumpbox.sandbox.yaml) — a minimal jumpbox sandbox definition.
 - [`examples/teardown.sh`](examples/teardown.sh) — parameterized teardown of a CLI-provisioned Mac.
+- [`examples/sweep-orphans.sh`](examples/sweep-orphans.sh) — find and (with `--apply`) clean up Mac resources left behind by deleted sandboxes.
+- [`examples/agents-snippet.md`](examples/agents-snippet.md) — instructions to copy into your app repo's `AGENTS.md` so a coding agent in the workspace builds and tests through `mac-run.sh`.
 
 ## License
 

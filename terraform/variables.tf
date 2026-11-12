@@ -23,8 +23,20 @@ variable "subnet_id" {
   type        = string
 }
 
+variable "ssh_ingress_cidrs" {
+  description = "CIDRs allowed to reach the Mac on TCP 22. Set this to your Crafting cluster egress CIDR."
+  type        = list(string)
+  default     = ["0.0.0.0/0"]
+}
+
+variable "data_volume_size" {
+  description = "Size in GiB of the persistent EBS data volume that holds the synced repo and DerivedData"
+  type        = number
+  default     = 200
+}
+
 variable "suspended" {
-  description = "When true, the instance is terminated but the Dedicated Host persists"
+  description = "Deprecated and ignored: the instance now keeps running through suspend. Kept so templates that still pass -var suspended=true don't fail."
   type        = bool
   default     = false
 }
